@@ -1,0 +1,7 @@
+name: libero
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.8.13
+prefix: /home/zx/miniconda3/envs/libero

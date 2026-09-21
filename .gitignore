@@ -11,8 +11,19 @@ experiments_saved/
 clip/
 gpt/
 bert/
+/bert-base-cased/
+/myexperiment/outputs/
 logs/
 
 *.mp4
 libero.egg-info/
 .vscode/
+datasets/
+outputs/
+results/videos/
+*.hdf5
+*.pt
+*.pth
+*.bin
+model_cache/
+__pycache__/
