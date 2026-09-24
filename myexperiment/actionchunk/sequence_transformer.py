@@ -5,8 +5,6 @@ import os
 import sys
 from typing import List, Sequence, Tuple
 
-import h5py
-import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset
@@ -17,12 +15,16 @@ for path in (HERE, BC_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from bc import NormalizationStats, PathLike, read_demo_arrays
+from bc import NormalizationStats, PathLike, prepare_demo_tensors
 from action_chunking import masked_chunk_mse
 
 
 class LIBEROSequenceChunkDataset(Dataset):
-    """返回历史 H 帧观测、未来 K 个动作和动作有效 mask。"""
+    """返回历史 H 帧观测、未来 K 个动作和动作有效 mask。
+
+    初始化时一次性读取、resize、归一化指定 demos 并缓存到内存，
+    __getitem__ 只做内存索引，避免每个样本重复打开 HDF5 并读取整条轨迹。
+    """
 
     def __init__(
         self,
@@ -40,10 +42,13 @@ class LIBEROSequenceChunkDataset(Dataset):
         self.history_length = history_length
         self.chunk_size = chunk_size
         self.image_size = image_size
+        self.demos = {}
         self.index: List[Tuple[str, int]] = []
         for demo_name in demo_names:
-            with h5py.File(self.hdf5_path, "r") as handle:
-                length = handle["data"][demo_name]["actions"].shape[0]
+            self.demos[demo_name] = prepare_demo_tensors(
+                self.hdf5_path, demo_name, self.stats, self.image_size
+            )
+            length = self.demos[demo_name][2].shape[0]
             self.index.extend((demo_name, t) for t in range(length))
 
     def __len__(self):
@@ -51,30 +56,27 @@ class LIBEROSequenceChunkDataset(Dataset):
 
     def __getitem__(self, index):
         demo_name, timestep = self.index[index]
-        images, states, actions = read_demo_arrays(self.hdf5_path, demo_name)
+        images, states, actions = self.demos[demo_name]
 
         # 历史不足 H 帧时重复最早一帧，保持张量尺寸固定。
+        # images/states/actions 已在初始化时 resize 并归一化。
         history_indices = [max(0, timestep - self.history_length + 1 + i)
                            for i in range(self.history_length)]
-        image_batch = torch.from_numpy(images[history_indices]).permute(0, 3, 1, 2).float() / 255.0
-        image_batch = torch.nn.functional.interpolate(
-            image_batch, (self.image_size, self.image_size), mode="bilinear", align_corners=False
-        )
-        state_batch = (states[history_indices] - self.stats.state_mean) / self.stats.state_std
+        image_batch = images[history_indices]
+        state_batch = states[history_indices]
 
         end = min(timestep + self.chunk_size, len(actions))
         valid = end - timestep
-        chunk = np.zeros((self.chunk_size, actions.shape[-1]), dtype=np.float32)
-        mask = np.zeros(self.chunk_size, dtype=np.float32)
+        chunk = torch.empty((self.chunk_size, actions.shape[-1]), dtype=actions.dtype)
+        mask = torch.zeros(self.chunk_size, dtype=torch.float32)
         chunk[:valid] = actions[timestep:end]
         chunk[valid:] = actions[end - 1]
-        chunk = (chunk - self.stats.action_mean) / self.stats.action_std
         mask[:valid] = 1.0
         return (
             image_batch,
-            torch.from_numpy(state_batch).float(),
-            torch.from_numpy(chunk).float(),
-            torch.from_numpy(mask).float(),
+            state_batch,
+            chunk,
+            mask,
         )
 
 

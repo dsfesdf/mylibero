@@ -1,7 +1,8 @@
 """最小视觉 Behavior Cloning (BC) 实现。
 
 从 LIBERO HDF5 demonstrations 读取 (image, state, action)，使用小型 CNN + MLP
-预测当前时刻的 7 维动作。Dataset 默认不保留 h5py 文件句柄，避免多进程 pickle 错误。
+预测当前时刻的 7 维动作。Dataset 会在初始化时把指定 demos 缓存到内存，避免
+训练时每个 sample 反复打开 HDF5 并读取整条轨迹。
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from typing import Dict, List, Sequence, Tuple, Union
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset
 
@@ -67,15 +69,38 @@ def compute_stats(hdf5_path: PathLike, demo_names: Sequence[str]) -> Normalizati
     )
 
 
+def prepare_demo_tensors(
+    hdf5_path: PathLike,
+    demo_name: str,
+    stats: NormalizationStats,
+    image_size: int,
+):
+    """一次性读取、resize、归一化一个 demo，供训练 dataset 复用。"""
+    images, states, actions = read_demo_arrays(hdf5_path, demo_name)
+    image_tensor = torch.from_numpy(images).permute(0, 3, 1, 2).float().div_(255.0)
+    image_tensor = F.interpolate(
+        image_tensor, (image_size, image_size), mode="bilinear", align_corners=False
+    )
+    state_tensor = torch.from_numpy(
+        ((states - stats.state_mean) / stats.state_std).astype(np.float32, copy=False)
+    )
+    action_tensor = torch.from_numpy(
+        ((actions - stats.action_mean) / stats.action_std).astype(np.float32, copy=False)
+    )
+    return image_tensor, state_tensor, action_tensor
+
+
 class LIBEROFrameDataset(Dataset):
     """将指定 demos 展平为逐帧监督样本。"""
     def __init__(self, hdf5_path: PathLike, demo_names: Sequence[str], stats: NormalizationStats, image_size: int = 84):
         self.hdf5_path, self.stats, self.image_size = str(hdf5_path), stats, image_size
+        self.demos = {}
         self.index: List[Tuple[str, int]] = []
         for demo_name in demo_names:
-            # 只读取长度，不保存 h5py.File 对象。
-            with h5py.File(self.hdf5_path, "r") as handle:
-                length = handle["data"][demo_name]["actions"].shape[0]
+            self.demos[demo_name] = prepare_demo_tensors(
+                self.hdf5_path, demo_name, self.stats, self.image_size
+            )
+            length = self.demos[demo_name][2].shape[0]
             self.index.extend((demo_name, t) for t in range(length))
 
     def __len__(self) -> int:
@@ -83,13 +108,8 @@ class LIBEROFrameDataset(Dataset):
 
     def __getitem__(self, index: int):
         demo_name, timestep = self.index[index]
-        images, states, actions = read_demo_arrays(self.hdf5_path, demo_name)
-        # HWC uint8 -> CHW float32，并把图像缩放到 [0, 1] 和 84x84。
-        image = torch.from_numpy(images[timestep]).permute(2, 0, 1).float() / 255.0
-        image = torch.nn.functional.interpolate(image[None], (self.image_size, self.image_size), mode="bilinear", align_corners=False)[0]
-        state = (states[timestep] - self.stats.state_mean) / self.stats.state_std
-        action = (actions[timestep] - self.stats.action_mean) / self.stats.action_std
-        return image, torch.from_numpy(state).float(), torch.from_numpy(action).float()
+        images, states, actions = self.demos[demo_name]
+        return images[timestep], states[timestep], actions[timestep]
 
 
 class SmallVisualBC(nn.Module):

@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0, help="只控制模型初始化、shuffle 和训练随机性")
     p.add_argument("--split-seed", type=int, default=0, help="只控制 train/val demo 划分")
     p.add_argument("--image-size", type=int, default=84)
-    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--num-workers", type=int, default=0, help="dataset 已缓存到内存；多 worker 会复制缓存")
     return p.parse_args()
 
 

@@ -59,32 +59,87 @@ class ACT(nn.Module):
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
+        visual_representation: str = "global_pool",
+        spatial_grid: int = 6,
+        observation_mode: str = "both",
     ):
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError("d_model 必须能被 num_heads 整除")
+        if visual_representation not in {"global_pool", "spatial_tokens"}:
+            raise ValueError("visual_representation 必须是 global_pool 或 spatial_tokens")
+        if observation_mode not in {"both", "image", "state"}:
+            raise ValueError("observation_mode 必须是 both、image 或 state")
+        if spatial_grid < 1:
+            raise ValueError("spatial_grid 必须 >= 1")
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.history_length = history_length
         self.chunk_size = chunk_size
         self.latent_dim = latent_dim
         self.d_model = d_model
+        self.visual_representation = visual_representation
+        self.spatial_grid = spatial_grid
+        self.observation_mode = observation_mode
 
-        # 视觉和状态编码器：每一帧变成一个 observation memory token。
-        self.image_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
-        )
-        self.state_encoder = nn.Sequential(
-            nn.Linear(state_dim, 64), nn.ReLU(inplace=True),
-        )
-        self.observation_projection = nn.Sequential(
-            nn.Linear(128 + 64, d_model), nn.LayerNorm(d_model), nn.GELU(),
-        )
-        self.observation_position = nn.Parameter(torch.zeros(1, history_length, d_model))
-        nn.init.normal_(self.observation_position, std=0.02)
+        # 保留 global_pool + both 的层命名和结构，以兼容已有 ACT checkpoint。
+        if visual_representation == "global_pool":
+            self.image_encoder = nn.Sequential(
+                nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
+                nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
+            )
+            self.state_encoder = nn.Sequential(
+                nn.Linear(state_dim, 64), nn.ReLU(inplace=True),
+            )
+            if observation_mode == "both":
+                input_dim = 128 + 64
+            elif observation_mode == "image":
+                input_dim = 128
+            else:
+                input_dim = 64
+            self.observation_projection = nn.Sequential(
+                nn.Linear(input_dim, d_model), nn.LayerNorm(d_model), nn.GELU(),
+            )
+            self.spatial_pool = None
+            self.spatial_projection = None
+            self.spatial_position = None
+            self.state_token_projection = None
+            self.observation_position = nn.Parameter(torch.zeros(1, history_length, d_model))
+            nn.init.normal_(self.observation_position, std=0.02)
+            tokens_per_frame = 1
+            visual_token_count = 0
+        else:
+            self.image_encoder = nn.Sequential(
+                nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
+                nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
+                nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
+            )
+            self.state_encoder = nn.Sequential(
+                nn.Linear(state_dim, 64), nn.ReLU(inplace=True),
+            )
+            self.spatial_pool = nn.AdaptiveAvgPool2d((spatial_grid, spatial_grid))
+            self.spatial_projection = nn.Linear(128, d_model)
+            self.spatial_position = nn.Parameter(
+                torch.zeros(1, spatial_grid * spatial_grid, d_model)
+            )
+            self.state_token_projection = nn.Linear(64, d_model)
+            nn.init.normal_(self.spatial_position, std=0.02)
+            self.observation_position = nn.Parameter(torch.zeros(1, history_length, d_model))
+            nn.init.normal_(self.observation_position, std=0.02)
+            if observation_mode == "state":
+                tokens_per_frame = 1
+                visual_token_count = 0
+            elif observation_mode == "image":
+                tokens_per_frame = spatial_grid * spatial_grid
+                visual_token_count = spatial_grid * spatial_grid
+            else:
+                tokens_per_frame = spatial_grid * spatial_grid + 1
+                visual_token_count = spatial_grid * spatial_grid
+        self.visual_token_count = visual_token_count
+        self.tokens_per_frame = tokens_per_frame
+        self.observation_token_count = history_length * tokens_per_frame
 
         # CVAE posterior q(z | observation, future action chunk)。
         self.posterior_action_projection = nn.Linear(action_dim, d_model)
@@ -100,9 +155,11 @@ class ACT(nn.Module):
         self.posterior_encoder = nn.TransformerEncoder(posterior_layer, num_layers=num_layers)
         self.posterior_stats = nn.Linear(d_model, 2 * latent_dim)
 
-        # decoder memory = H 个 observation token + 1 个 latent token。
+        # decoder memory = observation tokens + 1 个 latent token。
         self.latent_projection = nn.Linear(latent_dim, d_model)
-        self.memory_position = nn.Parameter(torch.zeros(1, history_length + 1, d_model))
+        self.memory_position = nn.Parameter(
+            torch.zeros(1, self.observation_token_count + 1, d_model)
+        )
         nn.init.normal_(self.memory_position, std=0.02)
         self.action_queries = nn.Parameter(torch.zeros(1, chunk_size, d_model))
         self.action_position = nn.Parameter(torch.zeros(1, chunk_size, d_model))
@@ -123,11 +180,51 @@ class ACT(nn.Module):
         batch, history = images.shape[:2]
         if history != self.history_length:
             raise ValueError(f"需要 history_length={self.history_length}，实际得到 {history}")
-        image_features = self.image_encoder(images.reshape(batch * history, *images.shape[2:]))
-        state_features = self.state_encoder(states.reshape(batch * history, -1))
-        tokens = self.observation_projection(torch.cat([image_features, state_features], dim=-1))
-        tokens = tokens.view(batch, history, self.d_model)
-        return tokens + self.observation_position[:, :history]
+        flat_images = images.reshape(batch * history, *images.shape[2:])
+        flat_states = states.reshape(batch * history, -1)
+
+        if self.visual_representation == "global_pool":
+            image_features = self.image_encoder(flat_images)
+            state_features = self.state_encoder(flat_states)
+            if self.observation_mode == "both":
+                inputs = torch.cat([image_features, state_features], dim=-1)
+            elif self.observation_mode == "image":
+                inputs = image_features
+            else:
+                inputs = state_features
+            tokens = self.observation_projection(inputs).view(batch, history, self.d_model)
+            return tokens + self.observation_position[:, :history]
+
+        state_features = self.state_encoder(flat_states)
+        frame_position = self.observation_position[:, :history].unsqueeze(2)
+        if self.observation_mode == "state":
+            tokens = self.state_token_projection(state_features).view(
+                batch, history, 1, self.d_model
+            )
+            return (tokens + frame_position).reshape(batch, history, self.d_model)
+
+        image_features = self.image_encoder(flat_images)
+        image_features = self.spatial_pool(image_features)
+        image_features = image_features.flatten(2).transpose(1, 2)
+        visual_tokens = self.spatial_projection(image_features)
+        visual_tokens = visual_tokens.view(
+            batch, history, self.visual_token_count, self.d_model
+        )
+        visual_tokens = (
+            visual_tokens
+            + self.spatial_position[:, : self.visual_token_count].unsqueeze(1)
+            + frame_position
+        )
+        if self.observation_mode == "image":
+            return visual_tokens.reshape(batch, self.observation_token_count, self.d_model)
+
+        # A state token is appended to each frame's spatial visual tokens.
+        state_tokens = self.state_token_projection(state_features).view(
+            batch, history, 1, self.d_model
+        )
+        state_tokens = state_tokens + frame_position
+        tokens = torch.cat([visual_tokens, state_tokens], dim=2)
+        return tokens.reshape(batch, self.observation_token_count, self.d_model)
 
     def posterior(self, observation_tokens: torch.Tensor, states: torch.Tensor, actions: torch.Tensor,
                   action_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:

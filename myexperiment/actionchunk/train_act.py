@@ -42,7 +42,14 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0, help="模型、shuffle 和训练随机性")
     p.add_argument("--split-seed", type=int, default=0, help="只控制 episode 划分")
     p.add_argument("--image-size", type=int, default=84)
-    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--visual-representation", choices=["global_pool", "spatial_tokens"], default="global_pool")
+    p.add_argument("--spatial-grid", type=int, default=6)
+    p.add_argument("--observation-mode", choices=["both", "image", "state"], default="both")
+    p.add_argument("--num-workers", type=int, default=4, help="缓存 dataset 的 DataLoader worker 数")
+    amp_group = p.add_mutually_exclusive_group()
+    amp_group.add_argument("--amp", dest="amp", action="store_true", help="在 CUDA 上使用 mixed precision")
+    amp_group.add_argument("--no-amp", dest="amp", action="store_false", help="关闭 CUDA mixed precision")
+    p.set_defaults(amp=True)
     return p.parse_args()
 
 
@@ -56,21 +63,30 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def run_epoch(model, loader, optimizer, device, kl_weight):
+def run_epoch(model, loader, optimizer, device, kl_weight, use_amp=False, scaler=None):
     training = optimizer is not None
     model.train(training)
     totals = {"loss": 0.0, "reconstruction": 0.0, "kl": 0.0, "count": 0}
     for images, states, target, mask in loader:
-        images, states = images.to(device), states.to(device)
-        target, mask = target.to(device), mask.to(device)
-        with torch.set_grad_enabled(training):
+        images = images.to(device, non_blocking=True)
+        states = states.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        with torch.set_grad_enabled(training), torch.cuda.amp.autocast(enabled=use_amp):
             prediction, mean, logvar = model(images, states, target, mask)
             loss, reconstruction, kl = act_loss(prediction, target, mask, mean, logvar, kl_weight)
-            if training:
-                optimizer.zero_grad(set_to_none=True)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+            if scaler is None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+            else:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
         n = images.size(0)
         totals["loss"] += loss.item() * n
         totals["reconstruction"] += reconstruction.item() * n
@@ -107,8 +123,17 @@ def main():
     train_set = LIBEROACTDataset(dataset_path, train_demos, stats, args.history_length, args.chunk_size, args.image_size)
     val_set = LIBEROACTDataset(dataset_path, val_demos, stats, args.history_length, args.chunk_size, args.image_size)
     loader_generator = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(train_set, args.batch_size, shuffle=True, num_workers=args.num_workers, generator=loader_generator)
-    val_loader = DataLoader(val_set, args.batch_size, shuffle=False, num_workers=args.num_workers)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if args.num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
+    train_loader = DataLoader(
+        train_set, shuffle=True, generator=loader_generator, **loader_kwargs
+    )
+    val_loader = DataLoader(val_set, shuffle=False, **loader_kwargs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ACT(
@@ -116,15 +141,27 @@ def main():
         history_length=args.history_length, chunk_size=args.chunk_size,
         latent_dim=args.latent_dim, d_model=args.d_model,
         num_heads=args.num_heads, num_layers=args.num_layers, dropout=args.dropout,
+        visual_representation=args.visual_representation,
+        spatial_grid=args.spatial_grid,
+        observation_mode=args.observation_mode,
     ).to(device)
+    use_amp = args.amp and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val, history, interrupted = float("inf"), [], False
     best_checkpoint_saved = False
     metrics_path = output_dir / "metrics.json"
-    print(f"device={device} history={args.history_length} chunk={args.chunk_size} latent={args.latent_dim} train_frames={len(train_set)} val_frames={len(val_set)}", flush=True)
+    print(
+        f"device={device} amp={use_amp} workers={args.num_workers} "
+        f"history={args.history_length} chunk={args.chunk_size} latent={args.latent_dim} "
+        f"train_frames={len(train_set)} val_frames={len(val_set)}",
+        flush=True,
+    )
     try:
         for epoch in range(1, args.epochs + 1):
-            train_metrics = run_epoch(model, train_loader, optimizer, device, args.kl_weight)
+            train_metrics = run_epoch(
+                model, train_loader, optimizer, device, args.kl_weight, use_amp, scaler
+            )
             with torch.no_grad():
                 val_metrics = run_epoch(model, val_loader, None, device, args.kl_weight)
             record = {"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}

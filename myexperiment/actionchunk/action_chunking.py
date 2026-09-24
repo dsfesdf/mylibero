@@ -20,13 +20,12 @@ for _path in (_HERE, _BC_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-import h5py
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-from bc import NormalizationStats, PathLike, read_demo_arrays
+from bc import NormalizationStats, PathLike, prepare_demo_tensors
 
 
 class LIBEROChunkDataset(Dataset):
@@ -46,10 +45,13 @@ class LIBEROChunkDataset(Dataset):
         self.stats = stats
         self.chunk_size = chunk_size
         self.image_size = image_size
+        self.demos = {}
         self.index: List[Tuple[str, int]] = []
         for demo_name in demo_names:
-            with h5py.File(self.hdf5_path, "r") as handle:
-                length = handle["data"][demo_name]["actions"].shape[0]
+            self.demos[demo_name] = prepare_demo_tensors(
+                self.hdf5_path, demo_name, self.stats, self.image_size
+            )
+            length = self.demos[demo_name][2].shape[0]
             self.index.extend((demo_name, t) for t in range(length))
 
     def __len__(self):
@@ -57,27 +59,23 @@ class LIBEROChunkDataset(Dataset):
 
     def __getitem__(self, index):
         demo_name, timestep = self.index[index]
-        images, states, actions = read_demo_arrays(self.hdf5_path, demo_name)
-        image = torch.from_numpy(images[timestep]).permute(2, 0, 1).float() / 255.0
-        image = torch.nn.functional.interpolate(
-            image[None], (self.image_size, self.image_size), mode="bilinear", align_corners=False
-        )[0]
-        state = (states[timestep] - self.stats.state_mean) / self.stats.state_std
+        images, states, actions = self.demos[demo_name]
+        image = images[timestep]
+        state = states[timestep]
 
         # 轨迹末尾用最后动作填充，但 mask=0，训练 loss 会忽略这些位置。
         end = min(timestep + self.chunk_size, len(actions))
         valid = end - timestep
-        chunk = np.zeros((self.chunk_size, actions.shape[-1]), dtype=np.float32)
-        mask = np.zeros(self.chunk_size, dtype=np.float32)
+        chunk = torch.empty((self.chunk_size, actions.shape[-1]), dtype=actions.dtype)
+        mask = torch.zeros(self.chunk_size, dtype=torch.float32)
         chunk[:valid] = actions[timestep:end]
         chunk[valid:] = actions[end - 1]
-        chunk = (chunk - self.stats.action_mean) / self.stats.action_std
         mask[:valid] = 1.0
         return (
             image,
-            torch.from_numpy(state).float(),
-            torch.from_numpy(chunk).float(),
-            torch.from_numpy(mask).float(),
+            state,
+            chunk,
+            mask,
         )
 
 
@@ -114,4 +112,3 @@ def masked_chunk_mse(prediction: torch.Tensor, target: torch.Tensor, mask: torch
     """只在真实未来动作位置计算 MSE。"""
     squared_error = (prediction - target).pow(2).mean(dim=-1)
     return (squared_error * mask).sum() / mask.sum().clamp_min(1.0)
-
