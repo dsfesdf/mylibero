@@ -16,7 +16,7 @@ from bc import LIBEROFrameDataset, SmallVisualBC, compute_stats, list_demos
 def parse_args():
     p = argparse.ArgumentParser(description="Train image+state BC on one LIBERO HDF5 task")
     p.add_argument("--dataset", required=True, help="单个 demonstrations .hdf5 文件")
-    p.add_argument("--output", default="myexperiment/outputs/bc_baseline")
+    p.add_argument("--output", default="myexperiment/bc/outputs/bc_baseline")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -68,17 +68,36 @@ def main():
     model = SmallVisualBC(state_dim=9, action_dim=7).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     best_val, history = float("inf"), []
+    best_checkpoint_saved = False
     print(f"device={device} train_frames={len(train_set)} val_frames={len(val_set)}", flush=True)
-    for epoch in range(1, args.epochs + 1):
-        train_loss = run_epoch(model, train_loader, optimizer, device)
-        val_loss = run_epoch(model, val_loader, None, device)
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        print(f"epoch {epoch:03d}/{args.epochs:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f}", flush=True)
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save({"model": model.state_dict(), "stats": stats.to_dict(), "config": vars(args), "train_demos": train_demos, "val_demos": val_demos}, output_dir / "best.pt")
-    (output_dir / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    print(f"saved checkpoint: {output_dir / 'best.pt'}", flush=True)
+    interrupted = False
+    try:
+        for epoch in range(1, args.epochs + 1):
+            train_loss = run_epoch(model, train_loader, optimizer, device)
+            val_loss = run_epoch(model, val_loader, None, device)
+            history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save({"model": model.state_dict(), "stats": stats.to_dict(), "config": vars(args), "train_demos": train_demos, "val_demos": val_demos}, output_dir / "best.pt")
+                best_checkpoint_saved = True
+            # 每个完整 epoch 后立即落盘；看到下面的 loss 输出时，文件已经写好。
+            (output_dir / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+            print(f"epoch {epoch:03d}/{args.epochs:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f}", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n收到 Ctrl+C：停止训练，正在保存已完成 epoch 的指标。", flush=True)
+    finally:
+        # 即使在 epoch 之间按 Ctrl+C，也把已经完成的 epoch 写入磁盘。
+        (output_dir / "metrics.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
+        print(f"saved metrics: {output_dir / 'metrics.json'}", flush=True)
+    if interrupted:
+        checkpoint_path = output_dir / "best.pt"
+        if best_checkpoint_saved:
+            print(f"保留当前最佳 checkpoint: {checkpoint_path}", flush=True)
+        else:
+            print("本次运行尚未完成任何 epoch，因此没有生成新的 best.pt。", flush=True)
+    else:
+        print(f"saved checkpoint: {output_dir / 'best.pt'}", flush=True)
 
 
 if __name__ == "__main__": main()

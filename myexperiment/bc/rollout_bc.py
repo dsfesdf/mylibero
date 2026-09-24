@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--num-rollouts", type=int, default=5)
     parser.add_argument("--max-steps", type=int, default=600)
-    parser.add_argument("--output", default="myexperiment/outputs/rollout_bc")
+    parser.add_argument("--output", default="myexperiment/bc/outputs/rollout_bc")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 

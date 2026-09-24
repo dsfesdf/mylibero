@@ -1,6 +1,8 @@
-# 最小视觉 Behavior Cloning
+# LIBERO BC、Action Chunking 与小型时序 Transformer
 
-这是 `mylibero` 仓库中的第一个个人实验：使用一个 LIBERO Spatial demonstration 文件，训练一个不依赖 OpenVLA 的最小视觉 BC 策略。
+这里保留了三个逐步增强、可以独立训练和评测的策略：单步视觉 BC、
+MLP action chunking，以及带历史观测和 action query 的小型时序 Transformer。
+三者都不依赖 OpenVLA，便于在同一份 LIBERO Spatial demonstrations 上做受控对照。
 
 ## 模型输入和输出
 
@@ -10,18 +12,41 @@ joint_states (7) + gripper_states (2) -> MLP -> 状态特征
 图像特征 + 状态特征 -> MLP -> 7 维 action
 ```
 
-这是单步 BC：当前图像和当前状态预测当前动作。暂时没有语言、历史帧、action chunking 或闭环 rollout，目的是先验证数据读取、归一化、训练和 checkpoint。
+单步 BC 是最小基线。`actionchunk/` 中还提供：
+
+```text
+当前图像 + 当前状态 -> Chunk MLP -> 未来 K 个动作
+最近 H 帧图像/状态 -> Transformer + K 个 action query -> 未来 K 个动作
+```
+
+两个 chunk 策略在 rollout 时都可选择 temporal aggregation。
 
 ## 文件
 
 ```text
 myexperiment/
-├── bc.py          # HDF5 Dataset、归一化统计和 CNN+MLP 策略
-├── train_bc.py    # 训练入口
-├── evaluate_bc.py # checkpoint 离线评测入口
-├── rollout_bc.py  # LIBERO 闭环 rollout、成功率和视频
+├── bc/
+│   ├── bc.py
+│   ├── train_bc.py
+│   ├── evaluate_bc.py
+│   ├── rollout_bc.py
+│   └── outputs/
+├── actionchunk/
+│   ├── action_chunking.py
+│   ├── train_action_chunking.py
+│   ├── evaluate_action_chunking.py
+│   ├── rollout_action_chunking.py
+│   ├── sequence_transformer.py
+│   ├── train_sequence_transformer.py
+│   ├── evaluate_sequence_transformer.py
+│   ├── rollout_sequence_transformer.py
+│   ├── act.py
+│   ├── train_act.py
+│   ├── evaluate_act.py
+│   ├── rollout_act.py
+│   └── outputs/
 ├── README.md
-└── outputs/       # 运行后生成的 checkpoint 和指标
+└── BC总结.md
 ```
 
 ## 运行
@@ -30,9 +55,9 @@ myexperiment/
 cd ~/LIBERO
 conda activate libero
 
-python myexperiment/train_bc.py \
+python myexperiment/bc/train_bc.py \
   --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
-  --output myexperiment/outputs/bc_next_to_plate \
+  --output myexperiment/bc/outputs/bc_next_to_plate \
   --epochs 10 \
   --batch-size 64
 ```
@@ -40,9 +65,9 @@ python myexperiment/train_bc.py \
 3050 显存不足时减小 batch：
 
 ```bash
-python myexperiment/train_bc.py \
+python myexperiment/bc/train_bc.py \
   --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
-  --output myexperiment/outputs/bc_debug \
+  --output myexperiment/bc/outputs/bc_debug \
   --epochs 2 \
   --batch-size 16
 ```
@@ -52,7 +77,7 @@ python myexperiment/train_bc.py \
 ## 输出
 
 ```text
-myexperiment/outputs/bc_next_to_plate/
+myexperiment/bc/outputs/bc_next_to_plate/
 ├── best.pt       # 模型参数、归一化统计、配置和 demo 划分
 └── metrics.json  # 每个 epoch 的 train/validation MSE
 ```
@@ -69,10 +94,10 @@ myexperiment/outputs/bc_next_to_plate/
 cd ~/LIBERO
 conda activate libero
 
-python myexperiment/evaluate_bc.py \
-  --checkpoint myexperiment/outputs/bc_smoke/best.pt \
+python myexperiment/bc/evaluate_bc.py \
+  --checkpoint myexperiment/bc/outputs/bc_smoke/best.pt \
   --split val \
-  --output myexperiment/outputs/bc_smoke/eval_val.json
+  --output myexperiment/bc/outputs/bc_smoke/eval_val.json
 ```
 
 输出中的主要指标：
@@ -85,15 +110,15 @@ python myexperiment/evaluate_bc.py \
 也可以检查训练集误差：
 
 ```bash
-python myexperiment/evaluate_bc.py \
-  --checkpoint myexperiment/outputs/bc_smoke/best.pt \
+python myexperiment/bc/evaluate_bc.py \
+  --checkpoint myexperiment/bc/outputs/bc_smoke/best.pt \
   --split train
 ```
 
 如果服务器上的数据路径和 checkpoint 中记录的本地路径不同，显式指定：
 
 ```bash
-python myexperiment/evaluate_bc.py \
+python myexperiment/bc/evaluate_bc.py \
   --checkpoint /path/to/best.pt \
   --dataset /share/2026zx/data/libero_spatial/task_demo.hdf5 \
   --split val
@@ -109,13 +134,13 @@ python myexperiment/evaluate_bc.py \
 cd ~/LIBERO
 conda activate libero
 
-MUJOCO_GL=egl python myexperiment/rollout_bc.py \
-  --checkpoint myexperiment/outputs/bc_smoke/best.pt \
+MUJOCO_GL=egl python myexperiment/bc/rollout_bc.py \
+  --checkpoint myexperiment/bc/outputs/bc_smoke/best.pt \
   --benchmark LIBERO_SPATIAL \
   --task-id 8 \
   --num-rollouts 5 \
   --max-steps 600 \
-  --output myexperiment/outputs/bc_smoke/rollouts
+  --output myexperiment/bc/outputs/bc_smoke/rollouts
 ```
 
 输出目录包含每条轨迹的视频及 `metrics.json`。`success_rate` 才是闭环任务效果。两轮 smoke 训练得到的模型很可能成功率为 0，这是合理结果：它主要用于验证代码闭环，而不是最终性能结论。
@@ -125,9 +150,9 @@ MUJOCO_GL=egl python myexperiment/rollout_bc.py \
 先运行一个小实验：
 
 ```bash
-python myexperiment/train_bc.py \
+python myexperiment/bc/train_bc.py \
   --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
-  --output myexperiment/outputs/bc_smoke \
+  --output myexperiment/bc/outputs/bc_smoke \
   --epochs 2 \
   --batch-size 16
 ```
@@ -143,12 +168,216 @@ saved checkpoint: .../best.pt
 
 重点检查：`device=cuda`、loss 不是 `nan`、`best.pt` 和 `metrics.json` 成功生成，并且 train loss 有下降趋势。
 
+## 严格的多 seed 对照
+
+训练脚本将两类随机性拆开：
+
+- `--split-seed`：只决定哪些完整 demos 属于 train/validation。
+- `--seed`：决定模型初始化、DataLoader shuffle、dropout 和训练随机性。
+
+正式比较时固定 `split_seed=0`，只改变训练 seed。这样三个模型看到完全相同的
+train/validation episodes，成功率差异不会混入“数据恰好分得更容易”的影响：
+
+```bash
+cd ~/LIBERO
+conda activate libero
+
+for seed in 0 1 2; do
+  python myexperiment/actionchunk/train_action_chunking.py \
+    --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
+    --output "myexperiment/actionchunk/outputs/chunk_bc_k10_split0_seed${seed}" \
+    --chunk-size 10 \
+    --epochs 50 \
+    --batch-size 64 \
+    --lr 3e-4 \
+    --weight-decay 1e-4 \
+    --split-seed 0 \
+    --seed "$seed"
+done
+```
+
+每个 `best.pt` 都保存了 `seed`、`split_seed`、`train_demos` 和 `val_demos`。
+正式报告应对三个 seed 的相同 rollout 协议汇报成功率的 `mean ± sample std`，
+不要只对 validation loss 求平均。
+
+### 提前停止训练
+
+三个训练脚本都捕获 `Ctrl+C`。在终端看到 validation loss 开始上升时可以直接按：
+
+```text
+Ctrl+C
+```
+
+程序会把已经完成的 epoch 写入 `metrics.json`，并保留截至目前 validation loss 最低的
+`best.pt`。正在执行但尚未完成的 epoch 不会写入，避免把半截 loss 当成完整 epoch。若在第一个
+epoch 完成前就中断，则只会生成 `metrics.json`，此时还没有可用的 `best.pt`。
+
+## 小型时序 Transformer
+
+### 模型结构
+
+```text
+最近 H 帧图像 -> 共享 CNN ┐
+                         ├-> H 个观测 token ┐
+最近 H 帧状态 -> 共享 MLP ┘                  ├-> Transformer -> K 个动作
+K 个可学习 action query --------------------┘                 (B, K, 7)
+```
+
+历史开头不足 `H` 帧时重复最早帧，轨迹末尾不足 `K` 个动作时用 mask 排除 padding loss。
+默认模型为 `H=5, K=10, d_model=128, heads=4, layers=2`，约 58 万参数，仍属于用于验证
+序列建模的小模型。它已经实现 `learnpath.md` 阶段三的核心机制，但不是完整论文 ACT：
+目前没有 CVAE latent、KL loss 和独立 Transformer decoder。
+
+### 训练
+
+```bash
+python myexperiment/actionchunk/train_sequence_transformer.py \
+  --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
+  --output myexperiment/actionchunk/outputs/transformer_h5_k10_split0_seed0 \
+  --history-length 5 \
+  --chunk-size 10 \
+  --d-model 128 \
+  --num-heads 4 \
+  --num-layers 2 \
+  --dropout 0.1 \
+  --epochs 30 \
+  --batch-size 64 \
+  --lr 3e-4 \
+  --weight-decay 1e-4 \
+  --split-seed 0 \
+  --seed 0
+```
+
+运行三个训练 seed 时，只需像上一节一样循环 `0 1 2`，并让输出目录包含 seed。
+HDF5 读取默认保持 `--num-workers 0`，避免 `h5py objects cannot be pickled`。
+
+### 离线评测
+
+```bash
+python myexperiment/actionchunk/evaluate_sequence_transformer.py \
+  --checkpoint myexperiment/actionchunk/outputs/transformer_h5_k10_split0_seed0/best.pt \
+  --split val \
+  --output myexperiment/actionchunk/outputs/transformer_h5_k10_split0_seed0/eval_val.json
+```
+
+`masked_normalized_mse` 只计算真实的未来动作，不包含轨迹尾部 padding。它用于检查训练，
+最终性能仍以闭环成功率为准。
+
+### LIBERO rollout
+
+```bash
+MUJOCO_GL=egl python myexperiment/actionchunk/rollout_sequence_transformer.py \
+  --checkpoint myexperiment/actionchunk/outputs/transformer_h5_k10_split0_seed0/best.pt \
+  --benchmark LIBERO_SPATIAL \
+  --task-id 8 \
+  --num-rollouts 40 \
+  --max-steps 270 \
+  --temporal-aggregation \
+  --aggregation-decay 0.2 \
+  --history-size 10 \
+  --output myexperiment/actionchunk/outputs/transformer_h5_k10_split0_seed0/rollouts_aggregate
+```
+
+去掉 `--temporal-aggregation` 即为每一步只执行最新 chunk 的第一个动作。公平对比
+Chunk MLP 与 Transformer 时，应固定数据划分、训练 seed、`K`、rollout 初始状态、
+最大步数和 aggregation 参数，只改变模型结构。
+
+## 完整 ACT 框架（CVAE + Transformer decoder）
+
+`actionchunk/act.py` 在已有 Chunk MLP 和小型时序 Transformer 之外，加入了 ACT 的核心
+训练机制：
+
+```text
+训练：observation + demonstration future actions
+      -> posterior Transformer -> q(z|observation, action)
+      -> sample z
+      -> Transformer decoder(action queries, observation memory, z)
+      -> K 个动作
+      -> reconstruction MSE + beta * KL(q(z)||N(0,I))
+
+推理：observation -> z=0 -> Transformer decoder -> K 个动作
+```
+
+代码入口：
+
+```text
+act.py             # ACT 模型、CVAE posterior、KL/MSE loss、dataset
+train_act.py      # 训练和 Ctrl+C 安全保存 metrics.json
+evaluate_act.py   # train/val/all 离线评测
+rollout_act.py    # LIBERO 闭环 rollout 和 temporal aggregation
+```
+
+这里的“完整”指 ACT 的核心 CVAE + action query + Transformer decoder 流程已经打通；
+它是适合当前单任务实验的小型实现，不是论文官方代码的逐行复刻。默认 `H=1, K=10,
+latent_dim=32`，先用当前观测验证机制，再做历史长度和 chunk size 消融。
+
+### 训练 ACT
+
+```bash
+python myexperiment/actionchunk/train_act.py \
+  --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
+  --output myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0 \
+  --history-length 1 \
+  --chunk-size 10 \
+  --latent-dim 32 \
+  --d-model 128 \
+  --num-heads 4 \
+  --num-layers 2 \
+  --kl-weight 10 \
+  --epochs 50 \
+  --batch-size 64 \
+  --lr 3e-4 \
+  --weight-decay 1e-4 \
+  --split-seed 0 \
+  --seed 0
+```
+
+可以把 `--history-length` 改成 `5` 使用最近五帧。正式多 seed 实验固定
+`--split-seed 0`，循环 `--seed 0 1 2`，每个 seed 使用独立输出目录。
+训练日志中的：
+
+- `train/val_mse`：动作 chunk 的 masked reconstruction MSE；
+- `train/val_kl`：CVAE posterior 与标准正态的 KL；
+- `train/val_loss`：`mse + kl_weight * kl / latent_dim`。
+
+`best.pt` 默认按 validation reconstruction MSE 保存，而不是按总 loss 保存，方便和之前
+的 Chunk MLP、小型 Transformer 做动作误差对比。按 `Ctrl+C` 会保存已经完成的 epoch 到
+`metrics.json`，并保留当前最优 checkpoint。
+
+### ACT 离线评测
+
+```bash
+python myexperiment/actionchunk/evaluate_act.py \
+  --checkpoint myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0/best.pt \
+  --split val \
+  --output myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0/eval_val.json
+```
+
+### ACT 闭环 rollout
+
+```bash
+MUJOCO_GL=egl python myexperiment/actionchunk/rollout_act.py \
+  --checkpoint myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0/best.pt \
+  --benchmark LIBERO_SPATIAL \
+  --task-id 8 \
+  --num-rollouts 40 \
+  --max-steps 270 \
+  --temporal-aggregation \
+  --aggregation-decay 0.2 \
+  --history-size 10 \
+  --output myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0/rollouts_aggregate
+```
+
+去掉 `--temporal-aggregation` 可以测每次只执行最新 chunk 第一个动作的结果。ACT 的
+推理没有 demonstration action，因此代码会固定使用 `z=0`；不要在 rollout 中把训练
+集的真实 future action 传给模型，否则会发生标签泄漏。
+
 ## 后续扩展
 
-1. 增加最近多帧输入。
-2. 增加 action chunking。
-3. 实现 ACT Transformer。
-4. 与官方 lifelong BC 和 OpenVLA-OFT 做统一评测。
+1. 对 Chunk MLP 与时序 Transformer 做三个训练 seed 的统一闭环评测。
+2. 对 `H`、`K`、action query 和 temporal aggregation 做消融。
+3. 对 ACT 的 latent_dim、KL 权重、history 和 chunk size 做消融。
+4. 若 ACT 在统一 rollout 上稳定优于 BC/Chunk，再与 OpenVLA-OFT 使用同一任务和协议比较。
 
 ## 在双 A100 服务器训练
 
@@ -204,6 +433,15 @@ git clone git@github.com:dsfesdf/mylibero.git LIBERO
 cd LIBERO
 git remote -v
 ```
+有 tmux，很好。训练必须用 tmux，因为：
+
+ssh 一旦断开，直接跑的进程会被杀掉。
+用 tmux 会话跑，断线也不影响。
+tmux new -s train      # 新建名为 train 的会话
+# 在会话里跑训练……
+# 按 Ctrl+b 然后按 d 脱离（detach），训练继续跑
+tmux attach -t train   # 下次回来重新接入
+tmux ls                # 列出所有会话
 
 如果已经克隆过：
 
@@ -238,6 +476,7 @@ python -m pip install \
   --extra-index-url https://download.pytorch.org/whl/cu113
 ```
 
+
 再安装 LIBERO 和最小 BC 所需依赖：
 
 ```bash
@@ -265,11 +504,11 @@ PY
 ```bash
 rsync -avhP \
   ~/LIBERO/libero/datasets/libero_spatial/ \
-  2026zx@<server>:/share/2026zx/LIBERO/libero/datasets/libero_spatial/
+  2026zx@10.246.1.32:/share/2026zx/LIBERO/libero/datasets/libero_spatial/
 
 rsync -avhP \
-  ~/LIBERO/myexperiment/outputs/bc_smoke/ \
-  2026zx@<server>:/share/2026zx/LIBERO/myexperiment/outputs/bc_smoke/
+  ~/LIBERO/myexperiment/bc/outputs/bc_smoke/ \
+  2026zx@10.246.1.32:/share/2026zx/LIBERO/myexperiment/bc/outputs/bc_smoke/
 ```
 
 在服务器检查：
@@ -278,7 +517,7 @@ rsync -avhP \
 find /share/2026zx/LIBERO/libero/datasets/libero_spatial \
   -maxdepth 1 -name '*.hdf5' | wc -l
 du -sh /share/2026zx/LIBERO/libero/datasets/libero_spatial
-ls -lh /share/2026zx/LIBERO/myexperiment/outputs/bc_smoke/best.pt
+ls -lh /share/2026zx/LIBERO/myexperiment/bc/outputs/bc_smoke/best.pt
 ```
 
 ### 6. 先在服务器测试已有权重
@@ -289,11 +528,11 @@ source /share/2026zx/miniforge3/etc/profile.d/conda.sh
 conda activate libero
 export CUDA_VISIBLE_DEVICES=2
 
-python myexperiment/evaluate_bc.py \
-  --checkpoint myexperiment/outputs/bc_smoke/best.pt \
+python myexperiment/bc/evaluate_bc.py \
+  --checkpoint myexperiment/bc/outputs/bc_smoke/best.pt \
   --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
   --split val \
-  --output myexperiment/outputs/bc_smoke/eval_a100.json
+  --output myexperiment/bc/outputs/bc_smoke/eval_a100.json
 ```
 
 ### 7. 使用 tmux 训练
@@ -306,14 +545,14 @@ cd /share/2026zx/LIBERO
 source /share/2026zx/miniforge3/etc/profile.d/conda.sh
 conda activate libero
 export CUDA_VISIBLE_DEVICES=2
-mkdir -p myexperiment/outputs/bc_a100
+mkdir -p myexperiment/bc/outputs/bc_a100
 
-python -u myexperiment/train_bc.py \
+python -u myexperiment/bc/train_bc.py \
   --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
-  --output myexperiment/outputs/bc_a100 \
+  --output myexperiment/bc/outputs/bc_a100 \
   --epochs 50 \
   --batch-size 256 \
-  2>&1 | tee myexperiment/outputs/bc_a100/train.log
+  2>&1 | tee myexperiment/bc/outputs/bc_a100/train.log
 ```
 
 按 `Ctrl+B`，再按 `D`，可退出 tmux 而不中止训练。重新进入：
@@ -342,16 +581,16 @@ watch -n 2 nvidia-smi -i 2
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=08:00:00
-#SBATCH --output=myexperiment/outputs/bc_a100/slurm-%j.out
+#SBATCH --output=myexperiment/bc/outputs/bc_a100/slurm-%j.out
 
 source /share/2026zx/miniforge3/etc/profile.d/conda.sh
 conda activate libero
 cd /share/2026zx/LIBERO
-mkdir -p myexperiment/outputs/bc_a100
+mkdir -p myexperiment/bc/outputs/bc_a100
 
-python -u myexperiment/train_bc.py \
+python -u myexperiment/bc/train_bc.py \
   --dataset libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5 \
-  --output myexperiment/outputs/bc_a100 \
+  --output myexperiment/bc/outputs/bc_a100 \
   --epochs 50 \
   --batch-size 256
 ```
@@ -359,7 +598,7 @@ python -u myexperiment/train_bc.py \
 作业提交和查看：
 
 ```bash
-mkdir -p myexperiment/outputs/bc_a100
+mkdir -p myexperiment/bc/outputs/bc_a100
 sbatch myexperiment/scripts/train_bc.slurm
 squeue -u "$USER"
 ```
@@ -372,8 +611,18 @@ Slurm 会负责分配 GPU，此时通常不要手动写死 `CUDA_VISIBLE_DEVICES
 
 ```bash
 rsync -avhP \
-  2026zx@<server>:/share/2026zx/LIBERO/myexperiment/outputs/bc_a100/ \
-  ~/LIBERO/myexperiment/outputs/bc_a100/
+  2026zx@<server>:/share/2026zx/LIBERO/myexperiment/bc/outputs/bc_a100/ \
+  ~/LIBERO/myexperiment/bc/outputs/bc_a100/
 ```
 
 建议只回传 `best.pt`、`metrics.json`、评测 JSON 和日志。原始数据无需反复复制。
+
+### 10性能提升
+__getitem__ 每次重开文件
+
+Apply
+def __getitem__(self, index):
+    demo_name, timestep = self.index[index]
+    images, states, actions = read_demo_arrays(self.hdf5_path, demo_name)  # 读整条 demo
+    ...
+缺点很明确：取一帧，却把整条 demo 重新读一遍。如果一条 demo 有 500 帧，你要取第 3 帧，它把 500 帧全读了。效率很低（我上次建议的改进点就是这个）。正确做法一般是缓存到内存，或用 num_workers + 每进程保存句柄。

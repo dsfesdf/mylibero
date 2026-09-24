@@ -100,7 +100,7 @@ class SmallVisualBC(nn.Module):
             nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
-        ##4*4池化
+        ##更大池化
         #     nn.AdaptiveAvgPool2d((4, 4)), nn.Flatten(),
         # )
         # self.state_encoder = nn.Sequential(nn.Linear(state_dim, 64), nn.ReLU(inplace=True), nn.Linear(64, 64), nn.ReLU(inplace=True))
@@ -111,8 +111,6 @@ class SmallVisualBC(nn.Module):
         )
         self.state_encoder = nn.Sequential(nn.Linear(state_dim, 64), nn.ReLU(inplace=True), nn.Linear(64, 64), nn.ReLU(inplace=True))
         self.action_head = nn.Sequential(nn.Linear(576, 128), nn.ReLU(inplace=True), nn.Linear(128, action_dim))
-
-        ##1*1池化
         #     nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
         # )
         # self.state_encoder = nn.Sequential(nn.Linear(state_dim, 64), nn.ReLU(inplace=True), nn.Linear(64, 64), nn.ReLU(inplace=True))

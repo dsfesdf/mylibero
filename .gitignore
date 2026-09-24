@@ -27,3 +27,13 @@ results/videos/
 *.bin
 model_cache/
 __pycache__/
+
+# 新增：忽略任意层级的输出/结果/缓存/视频/权重
+**/outputs/
+**/*.mp4
+**/*.pt
+**/*.pth
+**/*.bin
+**/*.hdf5
+.sentry-native/
+*.pyc
