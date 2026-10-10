@@ -617,12 +617,271 @@ rsync -avhP \
 
 建议只回传 `best.pt`、`metrics.json`、评测 JSON 和日志。原始数据无需反复复制。
 
-### 10性能提升
-__getitem__ 每次重开文件
+### 10. 性能优化
 
-Apply
+#### 10.1 优化前：每个样本都重新读取整条 demo
+
+最初的 `__getitem__` 是这样实现的：
+
+```python
 def __getitem__(self, index):
     demo_name, timestep = self.index[index]
     images, states, actions = read_demo_arrays(self.hdf5_path, demo_name)  # 读整条 demo
+    # 然后再对当前帧做 resize、归一化……
+```
+
+而 `read_demo_arrays` 每次调用都会：
+
+```python
+def read_demo_arrays(hdf5_path, demo_name):
+    with h5py.File(hdf5_path, "r") as handle:          # ① 重新打开 HDF5 文件
+        demo = handle["data"][demo_name]
+        images = np.asarray(demo["obs"]["agentview_rgb"], dtype=np.uint8)   # ② 深拷贝整条图像
+        joint_states = np.asarray(demo["obs"]["joint_states"], dtype=np.float32)
+        gripper_states = np.asarray(demo["obs"]["gripper_states"], dtype=np.float32)
+        actions = np.asarray(demo["actions"], dtype=np.float32)
     ...
-缺点很明确：取一帧，却把整条 demo 重新读一遍。如果一条 demo 有 500 帧，你要取第 3 帧，它把 500 帧全读了。效率很低（我上次建议的改进点就是这个）。正确做法一般是缓存到内存，或用 num_workers + 每进程保存句柄。
+```
+
+问题很明确：**取一帧，却把整条 demo 重新读一遍**。如果一条 demo 有 500 帧，
+要取第 3 帧，也会打开文件并把 500 帧图像全部读进内存再做深拷贝。而且 resize、
+`/255` 归一化、state/action 标准化也都在 `__getitem__` 里**每帧重复做一遍**。
+
+这条数据管线成为真正的瓶颈：A100 算力远没打满，显存占用只有百分之几，GPU 大部分时间在
+“等数据”。瓶颈不在 GPU，而在 I/O 与重复预处理。
+
+#### 10.2 优化后：一次性缓存到内存 + 预处理器化
+
+核心思路：**在 dataset 初始化时，一次性把用到的每条 demo 读出来，并提前完成
+resize 和归一化，之后 `__getitem__` 只做纯内存索引。**
+
+新增一个预处理器：
+
+```python
+def prepare_demo_tensors(hdf5_path, demo_name, stats, image_size):
+    images, states, actions = read_demo_arrays(hdf5_path, demo_name)   # 每条 demo 只读一次
+    # 图像：HWC uint8 -> CHW float [0,1]，并提前 resize 到 image_size
+    image_tensor = torch.from_numpy(images).permute(0, 3, 1, 2).float().div_(255.0)
+    image_tensor = F.interpolate(
+        image_tensor, (image_size, image_size), mode="bilinear", align_corners=False
+    )
+    # state/action：提前标准化，训练时直接取用
+    state_tensor = torch.from_numpy(((states - stats.state_mean) / stats.state_std).astype(np.float32, copy=False))
+    action_tensor = torch.from_numpy(((actions - stats.action_mean) / stats.action_std).astype(np.float32, copy=False))
+    return image_tensor, state_tensor, action_tensor
+```
+
+各个 dataset 改为缓存实现，以逐帧 BC 的 `LIBEROFrameDataset` 为例：
+
+```python
+class LIBEROFrameDataset(Dataset):
+    def __init__(self, hdf5_path, demo_names, stats, image_size=84):
+        self.hdf5_path, self.stats, self.image_size = str(hdf5_path), stats, image_size
+        self.demos = {}
+        self.index = []
+        for demo_name in demo_names:
+            # 初始化时一次性读取 + resize + 归一化，缓存到 self.demos
+            self.demos[demo_name] = prepare_demo_tensors(
+                self.hdf5_path, demo_name, self.stats, self.image_size
+            )
+            length = self.demos[demo_name][2].shape[0]
+            self.index.extend((demo_name, t) for t in range(length))
+
+    def __getitem__(self, index):
+        demo_name, timestep = self.index[index]
+        images, states, actions = self.demos[demo_name]   # 纯内存索引，零 I/O
+        return images[timestep], states[timestep], actions[timestep]
+```
+
+同样的缓存机制应用到了其它两个 dataset：
+
+```text
+bc/bc.py                            -> LIBEROFrameDataset           (逐帧 BC)
+actionchunk/action_chunking.py      -> LIBEROChunkDataset           (Chunk MLP)
+actionchunk/sequence_transformer.py -> LIBEROSequenceChunkDataset   (时序 Transformer / ACT)
+```
+
+`actionchunk/act.py` 中的 `LIBEROACTDataset` 直接继承 `LIBEROSequenceChunkDataset`，
+所以时序 Transformer 和 ACT 共用同一份缓存数据集，无需重复实现。
+
+`LIBEROSequenceChunkDataset` 的缓存版 `__getitem__`（返回历史 H 帧观测和未来 K 个动作）：
+
+```python
+def __getitem__(self, index):
+    demo_name, timestep = self.index[index]
+    images, states, actions = self.demos[demo_name]    # 已 resize、已归一化
+
+    # 历史不足 H 帧时重复最早一帧，保持张量尺寸固定；只是索引，无需再处理
+    history_indices = [max(0, timestep - self.history_length + 1 + i)
+                       for i in range(self.history_length)]
+    image_batch = images[history_indices]
+    state_batch = states[history_indices]
+
+    # 轨迹末尾不足 K 个动作时用最后动作填充，mask=0 让 loss 忽略这些位置
+    end = min(timestep + self.chunk_size, len(actions))
+    valid = end - timestep
+    chunk = torch.empty((self.chunk_size, actions.shape[-1]), dtype=actions.dtype)
+    mask = torch.zeros(self.chunk_size, dtype=torch.float32)
+    chunk[:valid] = actions[timestep:end]
+    chunk[valid:] = actions[end - 1]
+    mask[:valid] = 1.0
+    return image_batch, state_batch, chunk, mask
+```
+
+关键点：缓存版把 `/255`、`interpolate`、state/action 标准化都**提前到 `__init__`**，
+`__getitem__` 里只剩索引和拼接，**数值与原实现完全等价**，训练结果不变，只是快很多。
+
+#### 10.3 DataLoader 侧：多进程、锁页内存、预取
+
+缓存之后，dataset 不再持有 h5py 文件句柄，因此可以安全地开启多进程 `DataLoader`，
+不再有 `h5py objects cannot be pickled` 的问题。训练脚本（以 `train_act.py` 为例）配置：
+
+```python
+p.add_argument("--num-workers", type=int, default=4, help="缓存 dataset 的 DataLoader worker 数")
+
+loader_kwargs = {
+    "batch_size": args.batch_size,
+    "num_workers": args.num_workers,          # 多进程并行取数据
+    "pin_memory": torch.cuda.is_available(),  # 锁页内存，加速 CPU->GPU 拷贝
+}
+if args.num_workers > 0:
+    loader_kwargs.update({
+        "persistent_workers": True,           # worker 常驻，跨 epoch 复用
+        "prefetch_factor": 2,                 # 每个 worker 预取更多 batch
+    })
+```
+
+各项含义：
+
+- `num_workers=4`：4 个子进程并行准备 batch，主进程不必等 I/O。
+- `pin_memory=True`：数据放入锁页内存，`to(device, non_blocking=True)` 时拷贝更快。
+- `persistent_workers=True`：epoch 之间不重建 worker，省去反复启动开销。
+- `prefetch_factor=2`：每个 worker 提前准备更多 batch，减少 GPU 空等。
+
+注意内存：缓存大小约为 (1 + `num_workers`) 份，worker 越多内存占用越高。先用
+`free -h` 评估，内存紧张就把 `--num-workers` 降到 2 或 0。
+
+#### 10.4 训练侧：异步搬运与混合精度
+
+训练循环里，数据搬运改为异步，并可选地用 AMP 混合精度：
+
+```python
+images = images.to(device, non_blocking=True)   # 配合 pin_memory 异步传输
+states = states.to(device, non_blocking=True)
+target = target.to(device, non_blocking=True)
+mask   = mask.to(device, non_blocking=True)
+
+with torch.set_grad_enabled(training), torch.cuda.amp.autocast(enabled=use_amp):
+    prediction, mean, logvar = model(images, states, target, mask)
+    loss, reconstruction, kl = act_loss(prediction, target, mask, mean, logvar, kl_weight)
+
+if training:
+    optimizer.zero_grad(set_to_none=True)
+    if scaler is None:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+    else:
+        scaler.scale(loss).backward()             # 放大 loss，防止 fp16 下溢
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+```
+
+- `non_blocking=True`：与 `pin_memory` 配合，实现 CPU->GPU 异步拷贝。
+- AMP：`autocast` 下前向用 fp16，`GradScaler` 处理梯度缩放，默认开启。
+- `--amp` / `--no-amp` 控制是否启用。
+
+注意：本项目的策略只有几十万参数，算力不是主要瓶颈，**最大的加速来自内存缓存（10.2）**；
+AMP 对这类小模型收益有限，属于锦上添花。
+
+#### 10.5 优化总结
+
+| 优化 | 位置 | 作用 |
+| --- | --- | --- |
+| 一次性缓存 demo 到内存 | 三个 dataset 的 `__init__` | 消除每样本重复读整条 HDF5，收益最大 |
+| 提前 resize 与归一化 | `prepare_demo_tensors` | `__getitem__` 只做索引，无重复计算 |
+| 多进程 DataLoader | `--num-workers` | 并行准备数据，避免 GPU 等 I/O |
+| 锁页内存 + 异步搬运 | `pin_memory` / `non_blocking` | 加速 CPU->GPU 拷贝 |
+| 常驻 worker + 预取 | `persistent_workers` / `prefetch_factor` | 减少 epoch 间重建与空等 |
+| 混合精度 | AMP | 小模型收益有限，可选 |
+
+一句话：**瓶颈从“每个样本读整条 demo”变为“一次性入内存 + 多进程喂数据”**，
+从而让 A100 不再被数据 I/O 拖慢。
+
+## 常用操作：Git 与 rsync
+
+### 1. Git：把代码改动同步到服务器
+
+代码和文档用 Git 同步，**不要**用它传数据集和权重（那些被 `.gitignore` 忽略）。
+
+```bash
+# 本地：提交并推送
+cd ~/LIBERO
+git add -A
+git commit -m "描述这次改动"
+git push origin master
+
+# 服务器：拉取最新代码
+cd /share/2026zx/LIBERO
+git pull origin master
+```
+
+查看当前状态：
+
+```bash
+git status            # 看有哪些改动
+git log --oneline -5  # 看最近 5 次提交
+```
+
+提交前确认没有把大文件加进去（`*.pt`、`*.mp4`、`outputs/` 应被忽略）：
+
+```bash
+git add -A --dry-run    # 只预览，不真正添加
+```
+
+### 2. rsync：传数据集、权重和结果
+
+数据集、checkpoint、rollout 视频走 rsync。**方向由“源 目标”决定**，`user@ip:路径`
+一端是服务器。
+
+服务器地址统一用 IP `2026zx@10.246.1.32`。
+
+**上传（本地 -> 服务器）**，例如把数据集传到服务器：
+
+```bash
+rsync -avhP \
+  ~/LIBERO/libero/datasets/libero_spatial/ \
+  2026zx@10.246.1.32:/share/2026zx/LIBERO/libero/datasets/libero_spatial/
+```
+
+**下载（服务器 -> 本地）**，例如把训练结果和 rollout 拉回来：
+
+```bash
+rsync -avhP \
+  2026zx@10.246.1.32:/share/2026zx/LIBERO/myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0_a100/ \
+  ~/LIBERO/myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0_a100/
+```
+
+**只拉一个文件**（例如权重）：
+
+```bash
+rsync -avhP \
+  2026zx@10.246.1.32:/share/2026zx/LIBERO/myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0_a100/best.pt \
+  ~/LIBERO/myexperiment/actionchunk/outputs/act_h1_k10_split0_seed0_a100/
+```
+
+参数说明：
+
+- `-a`：归档模式，保留权限、时间、目录结构。
+- `-v`：显示进度信息。
+- `-h`：人类可读的大小。
+- `-P`：显示进度并支持断点续传。
+
+要点：
+
+- **路径末尾的 `/` 很重要**：带 `/` 表示拷贝目录**内容**，不带表示连同目录本身一起拷贝。
+- 用 IP，不要用主机名（避免解析失败）。
+- 建议只回传 `best.pt`、`metrics.json`、评测 JSON、日志和需要的视频，原始数据不必反复复制。
+- 想免密码，先运行一次 `ssh-copy-id 2026zx@10.246.1.32`。
