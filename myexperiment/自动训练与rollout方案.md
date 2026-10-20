@@ -30,7 +30,7 @@ ACT 的 CVAE、deterministic、Flow 三种头在 image 模式下都不依赖真�
 | `deterministic` | 无 CVAE 的确定性 ACT | 5 | 10 | first、TA |
 | `flow` | 条件 Flow | 5 | 10 | first、TA |
 
-默认三种训练 seed=0/1/2，split seed=0，外部相机、纯视觉输入，50 epochs、batch64、lr=1e-4、weight_decay=1e-4、84×84、workers0。Sequence/ACT 使用 d128、4 heads、2 layers、dropout0.1；ACT KL=10、latent32，Flow Euler10步；ACT 默认 AMP，其他模型当前 FP32，可给套件加 `--no-amp` 关闭 ACT AMP。
+默认三种训练 seed=0/1/2，split seed=0，外部相机、纯视觉输入，50 epochs、batch64、lr=1e-4、weight_decay=1e-4、84×84、workers2。可用 `--num-workers 0/2/4` 指定训练 worker 数。Sequence/ACT 使用 d128、4 heads、2 layers、dropout0.1；ACT KL=10、latent32，Flow Euler10步；ACT 默认 AMP，其他模型当前 FP32，可给套件加 `--no-amp` 关闭 ACT AMP。
 
 共 **21 次训练、39 次 rollout 调用**。如果任务有 50 个官方初始状态，则是 1,950 个 episode，不包含训练。first/TA 复用同一份 best，不重复训练。first 是每步重规划只执行最新预测的第一个动作，不是开环连续执行 K 步。
 
@@ -64,7 +64,7 @@ python myexperiment/run_suite.py \
   --gpu 2 --execute
 ```
 
-它会依次完成一份权重的训练及 first/TA，再进入下一个模型/seed。终端显示任务进度，每个子进程输出写入对应 train.log 或 rollout.log。第一次执行会计算数据 SHA256，较大的 HDF5 需要等待磁盘读取完成。
+默认先依次完成全部21次训练，再开始39次 rollout，不再交替训练和评测。脚本每次只启动一个实验进程，尚未实现多个模型同时训练。终端显示任务进度，每个子进程输出写入对应 train.log 或 rollout.log。第一次执行会计算数据 SHA256，较大的 HDF5 需要等待磁盘读取完成。
 
 需要关闭终端后继续运行时，可由 shell 后台托管：
 
@@ -130,19 +130,37 @@ python myexperiment/run_suite.py \
 
 仅状态对照可用 `--observation-mode state --cameras none`。不要把默认纯视觉模式与 cameras=none 混用。
 
-### 单独训练或单独 rollout
+### A100 只训练，笔记本只 rollout
+
+服务器（使用实际 dataset 和 GPU 编号）：
 
 ```bash
 python myexperiment/run_suite.py \
   --dataset "$DATASET" --output-root myexperiment/results_v2/vision_agentview \
-  --gpu 2 --stage train --execute
-
-python myexperiment/run_suite.py \
-  --dataset "$DATASET" --output-root myexperiment/results_v2/vision_agentview \
-  --gpu 2 --stage rollout --execute
+  --batch-size 256 --num-workers 2 --gpu 2 --stage train --execute
 ```
 
-stage 不属于冻结协议，可以切换。其他参数需要与第一次执行一致，包括 models、seeds、相机、预算、场景和 policies。rollout 阶段要求存在本套件生成的完整训练标记，不用于导入任意旧权重；评测旧权重请直接使用原 rollout 脚本。
+训练完成后把整个 `vision_agentview` 结果目录复制到笔记本的仓库中。务必保留根目录的 `suite.json`、`split.json`，以及每组的 `best.pt`、`metrics.json`、`train.complete.json`；保留完整目录最简单。训练日志可保留供核查，rollout 不需要复制 HDF5。
+
+笔记本：
+
+```bash
+conda activate libero
+cd /home/zx/LIBERO
+python myexperiment/run_suite.py \
+  --output-root myexperiment/results_v2/vision_agentview \
+  --stage rollout --execute
+```
+
+`--stage rollout` 自动从该目录的 suite.json 恢复训练和评测配置，models、seeds、batch、场景等无需重写，命令行对这些配置的修改也不会生效；本阶段仅使用你指定的 output-root、gpu、execute。不会检查服务器的 dataset 路径，也不会改写原 suite.json。所有权重和输出路径重建为笔记本本地路径，已完成的评测在迁移后仍可跳过。
+
+rollout 阶段要求存在本套件生成的完整训练标记，不用于导入任意旧权重；要改变评测场景或其他协议，用独立输出目录直接调用原 rollout 脚本。
+
+### 已经启动的旧套件如何继续
+
+旧版本把 workers 固定为0。如果保留原结果目录继续训练，需要显式 `--num-workers 0` 并保留原来的 batch/其他配置，加 `--stage train` 即可先完成剩余训练。已完整完成的训练会跳过；这次执行顺序变化不会使已有权重失效。
+
+若想切换到默认 workers2，使用新的 output-root，避免新旧 worker 设置混入同一套件。中断训练仍不能续训；没有 complete 标记的目录需自行归档或改用新目录。
 
 ## 6. 完成检查与中断行为
 
@@ -150,7 +168,7 @@ stage 不属于冻结协议，可以切换。其他参数需要与第一次执�
 - 子进程失败立即停止套件，不悄悄跳过继续跑其他模型；检查日志后处理。
 - 即使训练器捕获 Ctrl+C 后以退出码0结束，套件仍会检查最终 epoch 是否等于规定预算；不足则不写 train.complete.json，也不进入 rollout。
 - 这里只支持**跳过已完整完成的任务**，不支持从中断 epoch 恢复。中断目录没有完成标记，重新执行会报错；先自行归档该具体目录，或使用新 output-root。脚本不会删除结果。
-- suite.json 固定数据路径/哈希和实验参数。修改配置须新建 output-root，避免把不同协议混在一张表。不要同时用多个进程启动同一个 output-root。
+- suite.json 固定数据路径/哈希和实验参数，包含 num_workers。训练阶段修改配置须新建 output-root；rollout 阶段恢复原配置并允许结果目录迁移。不要同时用多个进程启动同一个 output-root。
 - 代码本身不由 suite.json 冻结。正式启动前保存 Git 提交或代码快照，整批实验期间不要修改模型实现；不应在改过代码后把旧 complete 标记当作新实现的验证结果。
 
 ## 7. 输出与分析

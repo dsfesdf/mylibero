@@ -26,7 +26,7 @@ DEFAULT_MODELS = [name for name in MODELS if name != "bc"]
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--dataset", required=True)
+    p.add_argument("--dataset", default=None, help="训练必填；rollout 阶段从 suite.json 恢复配置")
     p.add_argument("--output-root", default="myexperiment/results_v2/vision_suite")
     p.add_argument("--models", nargs="+", choices=list(MODELS), default=DEFAULT_MODELS)
     p.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
@@ -36,6 +36,7 @@ def parse_args():
     p.add_argument("--val-ratio", type=float, default=.2)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--num-workers", type=int, default=2, help="训练 DataLoader worker 数，可设为0")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--image-size", type=int, default=84)
@@ -74,7 +75,7 @@ def build_jobs(args):
                     "--split-seed", str(args.split_seed), "--seed", str(seed),
                     "--val-ratio", str(args.val_ratio), "--epochs", str(args.epochs),
                     "--batch-size", str(args.batch_size), "--lr", str(args.lr),
-                    "--image-size", str(args.image_size), "--num-workers", "0",
+                    "--image-size", str(args.image_size), "--num-workers", str(args.num_workers),
                     "--cameras", camera, "--observation-mode", args.observation_mode]
                 if name != "bc":
                     train += ["--chunk-size", str(chunk), "--weight-decay", str(args.weight_decay)]
@@ -108,14 +109,45 @@ def build_jobs(args):
                         cmd += ["--flow-steps", str(args.flow_steps)]
                     jobs.append(dict(kind="rollout", model=name, camera=camera, seed=seed,
                                      policy=policy, run=run, output=output, command=cmd))
-    return jobs
+    # 稳定分组：所有模型/seed 训练结束后才开始评测。
+    return [job for job in jobs if job["kind"] == "train"] + [job for job in jobs if job["kind"] == "rollout"]
+
+
+def restore_rollout_config(args):
+    """跨机器评测直接复用训练协议，不要求复制 HDF5 或保留服务器绝对路径。
+
+    rollout 除 output-root/gpu/execute 外的参数由 manifest 决定，避免无意使用默认值。
+    """
+    manifest = args.output_root / "suite.json"
+    if not manifest.is_file():
+        raise FileNotFoundError("rollout 阶段需要复制完整套件目录（含 suite.json）：%s" % manifest)
+    saved = json.loads(manifest.read_text())
+    for key, value in saved.items():
+        if key in vars(args) and key not in ("output_root", "stage", "gpu", "execute"):
+            setattr(args, key, value)
+    # 旧套件硬编码 workers0；保持原协议，不按新默认值误认成 workers2。
+    args.num_workers = saved.get("num_workers", 0)
+    args.dataset = Path(saved["dataset"])
+    print("Rollout settings restored from:", manifest, flush=True)
 
 
 def run_job(job, args, env):
     output = job["output"]
     marker = output / ("train.complete.json" if job["kind"] == "train" else "rollout.complete.json")
     if marker.exists():
-        if json.loads(marker.read_text())["command"] != job["command"]:
+        saved_command = json.loads(marker.read_text())["command"]
+        current_command = job["command"]
+        if job["kind"] == "rollout":
+            # 数据目录移动后解释器、脚本、权重和输出的绝对路径会变化；
+            # 模型/seed 由所在目录确定，仍严格比较所有评测参数。
+            def portable(command):
+                result = [Path(command[1]).name] + command[2:]
+                for option in ("--checkpoint", "--output"):
+                    index = result.index(option)
+                    result[index + 1] = "<relocated>"
+                return result
+            saved_command, current_command = portable(saved_command), portable(current_command)
+        if saved_command != current_command:
             raise RuntimeError("完成标记与当前命令不一致：%s" % output)
         if not (output / "metrics.json").exists() or (job["kind"] == "train" and not (output / "best.pt").exists()):
             raise RuntimeError("完成标记存在但产物缺失：%s" % output)
@@ -165,12 +197,19 @@ def summarize(jobs, root):
 
 def main():
     args = parse_args()
-    args.dataset = Path(args.dataset).expanduser().resolve()
     args.output_root = Path(args.output_root).expanduser().resolve()
-    if not args.dataset.is_file():
-        raise FileNotFoundError(args.dataset)
+    if args.stage == "rollout":
+        restore_rollout_config(args)
+    else:
+        if args.dataset is None:
+            raise ValueError("训练阶段必须指定 --dataset")
+        args.dataset = Path(args.dataset).expanduser().resolve()
+        if not args.dataset.is_file():
+            raise FileNotFoundError(args.dataset)
     if min(args.epochs, args.batch_size, args.max_steps, args.image_size, args.flow_steps) < 1 or not 0 < args.val_ratio < 1:
         raise ValueError("训练/评测尺寸必须为正，且 0 < val_ratio < 1")
+    if args.num_workers < 0:
+        raise ValueError("num-workers 不能为负")
     for values in (args.seeds, args.models, args.cameras, args.policies):
         if len(set(values)) != len(values):
             raise ValueError("列表参数不能包含重复项")
@@ -184,16 +223,22 @@ def main():
     # 固定套件配置，避免在同一结果目录混入不同预算、数据或场景。
     record = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
               if key not in ("execute", "stage", "gpu")}
-    digest = hashlib.sha256()
-    with args.dataset.open("rb") as handle:
-        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-    record["dataset_sha256"] = digest.hexdigest()
-    args.output_root.mkdir(parents=True, exist_ok=True)
-    manifest = args.output_root / "suite.json"
-    if manifest.exists() and json.loads(manifest.read_text()) != record:
-        raise RuntimeError("套件配置已冻结，请使用新的 output-root")
-    manifest.write_text(json.dumps(record, indent=2))
+    if args.stage != "rollout":
+        digest = hashlib.sha256()
+        with args.dataset.open("rb") as handle:
+            for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        record["dataset_sha256"] = digest.hexdigest()
+        args.output_root.mkdir(parents=True, exist_ok=True)
+        manifest = args.output_root / "suite.json"
+        if manifest.exists():
+            saved = json.loads(manifest.read_text())
+            saved.setdefault("num_workers", 0)
+            if saved != record:
+                differences = ["%s: saved=%r, current=%r" % (key, saved.get(key), record.get(key))
+                               for key in sorted(set(saved) | set(record)) if saved.get(key) != record.get(key)]
+                raise RuntimeError("套件配置已冻结，请使用新的 output-root；差异：\n" + "\n".join(differences))
+        manifest.write_text(json.dumps(record, indent=2))
     env = os.environ.copy()
     env.setdefault("MUJOCO_GL", "egl")
     if args.gpu is not None:
