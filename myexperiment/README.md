@@ -1,5 +1,13 @@
 # LIBERO BC、Action Chunking 与小型时序 Transformer
 
+纯视觉自动训练与评测：[自动训练与 rollout 方案](自动训练与rollout方案.md)，入口 `python myexperiment/run_suite.py --dataset ...`，默认预览，添加 `--execute` 才运行。
+
+本轮重跑：统一数据划分、seed、rollout 协议和 ACT best 选择，并新增无 CVAE 的确定性 ACT，见 [统一协议与确定性 ACT](统一协议与确定性ACT.md)。新结果使用 `results_v2/`，旧结果保留；训练恢复暂不做。
+
+新增功能：四类策略均支持零路、外部、腕部和双路相机输入；ACT 可选择原 Transformer/CVAE
+动作头或 Flow Matching 动作头。新训练统一按纯观测推理的验证 MSE 选择 ACT 权重。
+具体参数、训练/评测命令和指标说明见 [多摄像头与流匹配](多摄像头与流匹配.md)。
+
 这里保留了三个逐步增强、可以独立训练和评测的策略：单步视觉 BC、
 MLP action chunking，以及带历史观测和 action query 的小型时序 Transformer。
 三者都不依赖 OpenVLA，便于在同一份 LIBERO Spatial demonstrations 上做受控对照。
@@ -340,8 +348,8 @@ python myexperiment/actionchunk/train_act.py \
 - `train/val_kl`：CVAE posterior 与标准正态的 KL；
 - `train/val_loss`：`mse + kl_weight * kl / latent_dim`。
 
-`best.pt` 默认按 validation reconstruction MSE 保存，而不是按总 loss 保存，方便和之前
-的 Chunk MLP、小型 Transformer 做动作误差对比。按 `Ctrl+C` 会保存已经完成的 epoch 到
+`best.pt` 新训练统一按纯观测推理的 `val_prior_mse` 保存：Transformer 使用 `z=0`，
+Flow 使用观测条件的噪声积分；后验 reconstruction 继续作为诊断指标。按 `Ctrl+C` 会保存已经完成的 epoch 到
 `metrics.json`，并保留当前最优 checkpoint。
 
 ### ACT 离线评测

@@ -37,22 +37,23 @@ def main():
     if args.split == "train": demos = checkpoint["train_demos"]
     elif args.split == "val": demos = checkpoint["val_demos"]
     else: demos = list_demos(dataset_path)
-    dataset = LIBEROSequenceChunkDataset(dataset_path, demos, stats, cfg["history_length"], cfg["chunk_size"], cfg.get("image_size", 84))
+    dataset = LIBEROSequenceChunkDataset(dataset_path, demos, stats, cfg["history_length"], cfg["chunk_size"], cfg.get("image_size", 84), cameras=cfg.get("cameras", "agentview"))
     loader = DataLoader(dataset, args.batch_size, shuffle=False, num_workers=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SmallSequenceTransformer(
-        9, 7, cfg["history_length"], cfg["chunk_size"], cfg["d_model"], cfg["num_heads"], cfg["num_layers"], cfg["dropout"]
+        9, 7, cfg["history_length"], cfg["chunk_size"], cfg["d_model"], cfg["num_heads"], cfg["num_layers"], cfg["dropout"], cameras=cfg.get("cameras", "agentview"), observation_mode=cfg.get("observation_mode", "both")
     ).to(device)
     model.load_state_dict(checkpoint["model"]); model.eval()
-    total, count = 0.0, 0
+    total, count, valid_count = 0.0, 0, 0.0
     with torch.no_grad():
         for images, states, target, mask in loader:
             prediction = model(images.to(device), states.to(device))
             loss = masked_chunk_mse(prediction, target.to(device), mask.to(device))
-            total += loss.item() * images.size(0); count += images.size(0)
-    result = {"checkpoint": str(checkpoint_path), "dataset": str(dataset_path), "split": args.split,
+            valid = mask.sum().item()
+            total += loss.item() * valid; valid_count += valid; count += images.size(0)
+    result = {"checkpoint": str(checkpoint_path), "dataset": str(dataset_path), "split": args.split, "cameras": cfg.get("cameras", "agentview"),
               "history_length": cfg["history_length"], "chunk_size": cfg["chunk_size"],
-              "num_frames": count, "masked_normalized_mse": total / max(count, 1)}
+              "num_frames": count, "masked_normalized_mse": total / max(valid_count, 1)}
     print(json.dumps(result, indent=2, ensure_ascii=False))
     if args.output:
         output = Path(args.output).expanduser().resolve(); output.parent.mkdir(parents=True, exist_ok=True)

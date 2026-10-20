@@ -1,10 +1,9 @@
-"""训练 CVAE + Transformer decoder 版 ACT。"""
+"""训练 ACT 的 Transformer/CVAE 或 Flow Matching 分支。"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import random
 import sys
 from pathlib import Path
 
@@ -14,12 +13,12 @@ for path in (HERE, BC_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from act import ACT, LIBEROACTDataset, act_loss
 from bc import compute_stats, list_demos
+from experiment_protocol import split_demos, set_seed
 
 
 def parse_args():
@@ -28,6 +27,8 @@ def parse_args():
     p.add_argument("--output", default="myexperiment/actionchunk/outputs/act_h1_k10")
     p.add_argument("--history-length", type=int, default=1)
     p.add_argument("--chunk-size", type=int, default=10)
+    p.add_argument("--action-head", choices=["transformer", "deterministic", "flow"], default="transformer")
+    p.add_argument("--flow-steps", type=int, default=10)
     p.add_argument("--latent-dim", type=int, default=32)
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--num-heads", type=int, default=4)
@@ -41,11 +42,14 @@ def parse_args():
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=0, help="模型、shuffle 和训练随机性")
     p.add_argument("--split-seed", type=int, default=0, help="只控制 episode 划分")
+    p.add_argument("--split-file", default=None, help="共用 demo 划分 JSON；不存在时创建")
+    p.add_argument("--val-seed", type=int, default=12345, help="固定验证生成噪声，与训练 RNG 独立")
     p.add_argument("--image-size", type=int, default=84)
+    p.add_argument("--cameras", choices=["none", "agentview", "wrist", "both"], default="agentview")
     p.add_argument("--visual-representation", choices=["global_pool", "spatial_tokens"], default="global_pool")
     p.add_argument("--spatial-grid", type=int, default=6)
     p.add_argument("--observation-mode", choices=["both", "image", "state"], default="both")
-    p.add_argument("--num-workers", type=int, default=4, help="缓存 dataset 的 DataLoader worker 数")
+    p.add_argument("--num-workers", type=int, default=0, help="CPU 张量缓存，默认单进程")
     amp_group = p.add_mutually_exclusive_group()
     amp_group.add_argument("--amp", dest="amp", action="store_true", help="在 CUDA 上使用 mixed precision")
     amp_group.add_argument("--no-amp", dest="amp", action="store_false", help="关闭 CUDA mixed precision")
@@ -53,28 +57,35 @@ def parse_args():
     return p.parse_args()
 
 
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 def run_epoch(model, loader, optimizer, device, kl_weight, use_amp=False, scaler=None):
     training = optimizer is not None
     model.train(training)
-    totals = {"loss": 0.0, "reconstruction": 0.0, "kl": 0.0, "count": 0}
+    totals = {"reconstruction": 0.0, "kl": 0.0, "flow": 0.0, "prior_mse": 0.0}
+    frame_count, action_count = 0, 0.0
     for images, states, target, mask in loader:
         images = images.to(device, non_blocking=True)
         states = states.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
         with torch.set_grad_enabled(training), torch.cuda.amp.autocast(enabled=use_amp):
-            prediction, mean, logvar = model(images, states, target, mask)
-            loss, reconstruction, kl = act_loss(prediction, target, mask, mean, logvar, kl_weight)
+            if model.action_head_type == "flow":
+                loss = model.flow_loss(images, states, target, mask)
+                flow = loss
+                reconstruction = loss.detach().new_zeros(())
+                kl = reconstruction
+            else:
+                prediction, mean, logvar = model(images, states, target, mask)
+                loss, reconstruction, kl = act_loss(prediction, target, mask, mean, logvar, kl_weight)
+                flow = loss.detach().new_zeros(())
+        prior_mse = loss.detach().new_zeros(())
+        if not training:
+            # 用与 rollout 一致的纯观测推理选择 checkpoint，避免后验标签辅助的偏差。
+            with torch.no_grad():
+                prediction = model.predict(images, states)
+                error = (prediction.float() - target.float()).square().mean(-1)
+                prior_mse = (error * mask).sum() / mask.sum().clamp_min(1)
+                if model.action_head_type == "flow":
+                    reconstruction = prior_mse
         if training:
             optimizer.zero_grad(set_to_none=True)
             if scaler is None:
@@ -88,12 +99,18 @@ def run_epoch(model, loader, optimizer, device, kl_weight, use_amp=False, scaler
                 scaler.step(optimizer)
                 scaler.update()
         n = images.size(0)
-        totals["loss"] += loss.item() * n
-        totals["reconstruction"] += reconstruction.item() * n
+        valid = mask.sum().item()
+        totals["reconstruction"] += reconstruction.item() * valid
         totals["kl"] += kl.item() * n
-        totals["count"] += n
-    count = max(totals.pop("count"), 1)
-    return {key: value / count for key, value in totals.items()}
+        totals["flow"] += flow.item() * valid
+        totals["prior_mse"] += prior_mse.item() * valid
+        frame_count += n
+        action_count += valid
+    metrics = {key: value / max(frame_count if key == "kl" else action_count, 1)
+               for key, value in totals.items()}
+    metrics["loss"] = (metrics["flow"] if model.action_head_type == "flow" else
+                       metrics["reconstruction"] + kl_weight * metrics["kl"] / max(model.latent_dim, 1))
+    return metrics
 
 
 def save_metrics(path: Path, history):
@@ -113,15 +130,10 @@ def main():
         raise FileNotFoundError(f"找不到数据集: {dataset_path}")
 
     demos = list_demos(dataset_path)
-    if len(demos) < 2:
-        raise ValueError("至少需要 2 个 demo")
-    split_rng = random.Random(args.split_seed)
-    split_rng.shuffle(demos)
-    val_count = max(1, int(round(len(demos) * args.val_ratio)))
-    val_demos, train_demos = demos[:val_count], demos[val_count:]
+    train_demos, val_demos = split_demos(demos, args.val_ratio, args.split_seed, args.split_file, output_dir)
     stats = compute_stats(dataset_path, train_demos)
-    train_set = LIBEROACTDataset(dataset_path, train_demos, stats, args.history_length, args.chunk_size, args.image_size)
-    val_set = LIBEROACTDataset(dataset_path, val_demos, stats, args.history_length, args.chunk_size, args.image_size)
+    train_set = LIBEROACTDataset(dataset_path, train_demos, stats, args.history_length, args.chunk_size, args.image_size, cameras=args.cameras)
+    val_set = LIBEROACTDataset(dataset_path, val_demos, stats, args.history_length, args.chunk_size, args.image_size, cameras=args.cameras)
     loader_generator = torch.Generator().manual_seed(args.seed)
     loader_kwargs = {
         "batch_size": args.batch_size,
@@ -144,6 +156,7 @@ def main():
         visual_representation=args.visual_representation,
         spatial_grid=args.spatial_grid,
         observation_mode=args.observation_mode,
+        cameras=args.cameras, action_head_type=args.action_head, flow_steps=args.flow_steps,
     ).to(device)
     use_amp = args.amp and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -162,23 +175,37 @@ def main():
             train_metrics = run_epoch(
                 model, train_loader, optimizer, device, args.kl_weight, use_amp, scaler
             )
-            with torch.no_grad():
+            # 固定验证噪声，且不改变训练 RNG 状态；各 epoch 的 flow MSE 可比较。
+            devices = [torch.cuda.current_device()] if device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices), torch.no_grad():
+                torch.manual_seed(args.val_seed)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed(args.val_seed)
                 val_metrics = run_epoch(model, val_loader, None, device, args.kl_weight)
             record = {"epoch": epoch, **{f"train_{k}": v for k, v in train_metrics.items()}, **{f"val_{k}": v for k, v in val_metrics.items()}}
+            # 不计算的指标写 null，避免把占位 0 误读成完美拟合。
+            record["train_prior_mse"] = None
+            if model.action_head_type == "flow":
+                record["train_reconstruction"] = None
             history.append(record)
-            if val_metrics["reconstruction"] < best_val:
-                best_val = val_metrics["reconstruction"]
+            if val_metrics["prior_mse"] < best_val:
+                best_val = val_metrics["prior_mse"]
                 torch.save({
                     "model": model.state_dict(), "stats": stats.to_dict(), "config": vars(args),
+                    "selection_metric": "val_prior_mse",
+                    "best_epoch": epoch, "best_val_prior_mse": best_val,
                     "train_demos": train_demos, "val_demos": val_demos,
                 }, output_dir / "best.pt")
                 best_checkpoint_saved = True
             save_metrics(metrics_path, history)
+            train_mse_label = f"{train_metrics['reconstruction']:.6f}" if model.action_head_type != "flow" else "n/a"
             print(
                 f"epoch {epoch:03d}/{args.epochs:03d} "
-                f"train_loss={train_metrics['loss']:.6f} train_mse={train_metrics['reconstruction']:.6f} "
+                f"train_loss={train_metrics['loss']:.6f} train_mse={train_mse_label} "
+                f"train_flow={train_metrics['flow']:.6f} "
                 f"val_loss={val_metrics['loss']:.6f} val_mse={val_metrics['reconstruction']:.6f} "
-                f"val_kl={val_metrics['kl']:.6f}", flush=True,
+                f"val_kl={val_metrics['kl']:.6f} val_flow={val_metrics['flow']:.6f} "
+                f"val_prior_mse={val_metrics['prior_mse']:.6f}", flush=True,
             )
     except KeyboardInterrupt:
         interrupted = True

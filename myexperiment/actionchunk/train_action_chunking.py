@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
 from pathlib import Path
 
@@ -15,12 +14,12 @@ for _path in (_HERE, _BC_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from action_chunking import LIBEROChunkDataset, SmallChunkBC, masked_chunk_mse
 from bc import compute_stats, list_demos
+from experiment_protocol import split_demos, set_seed
 
 
 def parse_args():
@@ -35,18 +34,13 @@ def parse_args():
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=0, help="只控制模型初始化、shuffle 和训练随机性")
     p.add_argument("--split-seed", type=int, default=0, help="只控制 train/val demo 划分")
+    p.add_argument("--split-file", default=None)
     p.add_argument("--image-size", type=int, default=84)
+    p.add_argument("--cameras", choices=["none", "agentview", "wrist", "both"], default="agentview")
+    p.add_argument("--observation-mode", choices=["both", "image", "state"], default="both")
     p.add_argument("--pool-size", type=int, default=2, choices=[1, 2, 4])
     p.add_argument("--num-workers", type=int, default=0, help="dataset 已缓存到内存；多 worker 会复制缓存")
     return p.parse_args()
-
-
-def set_seed(seed):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-    # 同一个 seed 重跑时尽量复现；不同 seed 仍会改变初始化和训练随机性。
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def run_epoch(model, loader, optimizer, device):
@@ -60,7 +54,9 @@ def run_epoch(model, loader, optimizer, device):
             loss = masked_chunk_mse(model(image, state), target, mask)
             if training:
                 optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
-        total += loss.item() * image.size(0); count += image.size(0)
+        # 按有效动作计数，而非 batch 样本数，避免 padding 比例改变指标权重。
+        valid = mask.sum().item()
+        total += loss.item() * valid; count += valid
     return total / max(count, 1)
 
 
@@ -71,14 +67,10 @@ def main():
     if not dataset_path.is_file(): raise FileNotFoundError(f"找不到数据集: {dataset_path}")
 
     demos = list_demos(dataset_path)
-    if len(demos) < 2: raise ValueError("至少需要 2 个 demo")
-    # split_seed 固定后，多个 train seed 会使用完全相同的 train/val demos。
-    rng = random.Random(args.split_seed); rng.shuffle(demos)
-    val_count = max(1, int(round(len(demos) * args.val_ratio)))
-    val_demos, train_demos = demos[:val_count], demos[val_count:]
+    train_demos, val_demos = split_demos(demos, args.val_ratio, args.split_seed, args.split_file, output_dir)
     stats = compute_stats(dataset_path, train_demos)
-    train_set = LIBEROChunkDataset(dataset_path, train_demos, stats, args.chunk_size, args.image_size)
-    val_set = LIBEROChunkDataset(dataset_path, val_demos, stats, args.chunk_size, args.image_size)
+    train_set = LIBEROChunkDataset(dataset_path, train_demos, stats, args.chunk_size, args.image_size, cameras=args.cameras)
+    val_set = LIBEROChunkDataset(dataset_path, val_demos, stats, args.chunk_size, args.image_size, cameras=args.cameras)
     loader_generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_set, args.batch_size, shuffle=True, num_workers=args.num_workers,
@@ -87,7 +79,7 @@ def main():
     val_loader = DataLoader(val_set, args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SmallChunkBC(9, 7, args.chunk_size, args.pool_size).to(device)
+    model = SmallChunkBC(9, 7, args.chunk_size, args.pool_size, cameras=args.cameras, observation_mode=args.observation_mode).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val, history = float("inf"), []
     best_checkpoint_saved = False
@@ -102,6 +94,7 @@ def main():
                 best_val = val_loss
                 torch.save({
                     "model": model.state_dict(), "stats": stats.to_dict(), "config": vars(args),
+                    "selection_metric": "val_mse", "best_epoch": epoch, "best_val_mse": best_val,
                     "train_demos": train_demos, "val_demos": val_demos,
                 }, output_dir / "best.pt")
                 best_checkpoint_saved = True

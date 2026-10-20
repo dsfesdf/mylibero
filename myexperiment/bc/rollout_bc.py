@@ -10,7 +10,8 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 
-from bc import NormalizationStats, SmallVisualBC
+from bc import NormalizationStats, SmallVisualBC, observation_image
+from experiment_protocol import add_rollout_args, rollout_indices, seed_episode, rollout_metadata
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
@@ -21,18 +22,15 @@ def parse_args():
     parser.add_argument("--benchmark", default="LIBERO_SPATIAL")
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--num-rollouts", type=int, default=5)
-    parser.add_argument("--max-steps", type=int, default=600)
+    parser.add_argument("--max-steps", type=int, default=270)
     parser.add_argument("--output", default="myexperiment/bc/outputs/rollout_bc")
-    parser.add_argument("--seed", type=int, default=0)
+    add_rollout_args(parser)
     return parser.parse_args()
 
 
-def make_model_input(obs, stats, image_size, device):
+def make_model_input(obs, stats, image_size, device, cameras="agentview"):
     """将 LIBERO 原始 observation 处理成训练时相同的模型输入。"""
-    image = torch.from_numpy(obs["agentview_image"]).permute(2, 0, 1).float() / 255.0
-    image = torch.nn.functional.interpolate(
-        image[None], (image_size, image_size), mode="bilinear", align_corners=False
-    ).to(device)
+    image = observation_image(obs, image_size, cameras)[None].to(device)
     state = np.concatenate([obs["robot0_joint_pos"], obs["robot0_gripper_qpos"]]).astype(np.float32)
     state = (state - stats.state_mean) / stats.state_std
     return image, torch.from_numpy(state).float()[None].to(device)
@@ -48,7 +46,7 @@ def main():
     image_size = checkpoint["config"].get("image_size", 84)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SmallVisualBC(len(stats.state_mean), len(stats.action_mean)).to(device)
+    model = SmallVisualBC(len(stats.state_mean), len(stats.action_mean), cameras=checkpoint["config"].get("cameras", "agentview"), observation_mode=checkpoint["config"].get("observation_mode", "both")).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     action_mean = torch.from_numpy(stats.action_mean).to(device)
@@ -57,6 +55,7 @@ def main():
     benchmark = get_benchmark(args.benchmark)()
     task = benchmark.get_task(args.task_id)
     init_states = benchmark.get_task_init_states(args.task_id)
+    indices = rollout_indices(args, len(init_states))
     env = OffScreenRenderEnv(
         bddl_file_name=benchmark.get_task_bddl_file_path(args.task_id),
         camera_heights=128,
@@ -64,17 +63,18 @@ def main():
     )
     successes, lengths = [], []
     try:
-        for rollout_id in range(args.num_rollouts):
+        for rollout_id, init_index in enumerate(indices):
+            seed_episode(env, args, init_index)
             env.reset()
-            obs = env.set_init_state(init_states[rollout_id % len(init_states)])
+            obs = env.set_init_state(init_states[init_index])
             # 与官方评测一致，先执行 5 个零动作稳定物理状态。
-            for _ in range(5):
+            for _ in range(args.settle_steps):
                 obs, _, _, _ = env.step(np.zeros(7, dtype=np.float32))
 
             frames = [obs["agentview_image"][::-1]]  # 仅视频显示时上下翻转。
             success = False
             for step in range(1, args.max_steps + 1):
-                image, state = make_model_input(obs, stats, image_size, device)
+                image, state = make_model_input(obs, stats, image_size, device, checkpoint["config"].get("cameras", "agentview"))
                 with torch.no_grad():
                     normalized_action = model(image, state)[0]
                     action = (normalized_action * action_std + action_mean).cpu().numpy()
@@ -89,15 +89,19 @@ def main():
             imageio.mimsave(video_path, frames, fps=20)
             successes.append(success)
             lengths.append(step)
-            print(f"rollout {rollout_id + 1}/{args.num_rollouts}: success={success} steps={step}", flush=True)
+            print(f"rollout {rollout_id + 1}/{len(indices)}: init={init_index} success={success} steps={step}", flush=True)
     finally:
         env.close()
 
     metrics = {
+        "observation_mode": checkpoint["config"].get("observation_mode", "both"),
         "benchmark": args.benchmark,
+        "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
+        "cameras": checkpoint["config"].get("cameras", "agentview"),
+        "max_steps": args.max_steps,
         "task_id": args.task_id,
         "task": task.name,
-        "num_rollouts": args.num_rollouts,
+        **rollout_metadata(args, indices),
         "successes": [bool(value) for value in successes],
         "episode_lengths": lengths,
         "success_rate": float(np.mean(successes)),

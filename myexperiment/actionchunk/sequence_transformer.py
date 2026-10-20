@@ -5,8 +5,6 @@ import os
 import sys
 from typing import List, Sequence, Tuple
 
-import h5py
-import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset
@@ -17,12 +15,16 @@ for path in (HERE, BC_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from bc import NormalizationStats, PathLike, read_demo_arrays
+from bc import NormalizationStats, PathLike, prepare_demo_tensors, camera_channels
 from action_chunking import masked_chunk_mse
 
 
 class LIBEROSequenceChunkDataset(Dataset):
-    """返回历史 H 帧观测、未来 K 个动作和动作有效 mask。"""
+    """按 demo 缓存预处理后的 CPU 张量；样本只做历史/未来窗口切片。
+
+    不持有 h5py 对象，因此可被 spawn 序列化。双相机缓存占用更多内存，
+    默认 num_workers=0；缓存中只保留每帧一次，不展开 H 个重复窗口。
+    """
 
     def __init__(
         self,
@@ -32,6 +34,7 @@ class LIBEROSequenceChunkDataset(Dataset):
         history_length: int = 5,
         chunk_size: int = 10,
         image_size: int = 84,
+        cameras="agentview",
     ):
         if history_length < 1 or chunk_size < 1:
             raise ValueError("history_length 和 chunk_size 必须 >= 1")
@@ -40,10 +43,15 @@ class LIBEROSequenceChunkDataset(Dataset):
         self.history_length = history_length
         self.chunk_size = chunk_size
         self.image_size = image_size
+        self.cameras = cameras
+        camera_channels(cameras)
+        self.demos = {}
         self.index: List[Tuple[str, int]] = []
         for demo_name in demo_names:
-            with h5py.File(self.hdf5_path, "r") as handle:
-                length = handle["data"][demo_name]["actions"].shape[0]
+            self.demos[demo_name] = prepare_demo_tensors(
+                self.hdf5_path, demo_name, stats, image_size, cameras
+            )
+            length = len(self.demos[demo_name][2])
             self.index.extend((demo_name, t) for t in range(length))
 
     def __len__(self):
@@ -51,30 +59,26 @@ class LIBEROSequenceChunkDataset(Dataset):
 
     def __getitem__(self, index):
         demo_name, timestep = self.index[index]
-        images, states, actions = read_demo_arrays(self.hdf5_path, demo_name)
+        images, states, actions = self.demos[demo_name]
 
         # 历史不足 H 帧时重复最早一帧，保持张量尺寸固定。
         history_indices = [max(0, timestep - self.history_length + 1 + i)
                            for i in range(self.history_length)]
-        image_batch = torch.from_numpy(images[history_indices]).permute(0, 3, 1, 2).float() / 255.0
-        image_batch = torch.nn.functional.interpolate(
-            image_batch, (self.image_size, self.image_size), mode="bilinear", align_corners=False
-        )
-        state_batch = (states[history_indices] - self.stats.state_mean) / self.stats.state_std
+        image_batch = images[history_indices]
+        state_batch = states[history_indices]
 
         end = min(timestep + self.chunk_size, len(actions))
         valid = end - timestep
-        chunk = np.zeros((self.chunk_size, actions.shape[-1]), dtype=np.float32)
-        mask = np.zeros(self.chunk_size, dtype=np.float32)
+        chunk = actions.new_empty(self.chunk_size, actions.shape[-1])
+        mask = torch.zeros(self.chunk_size)
         chunk[:valid] = actions[timestep:end]
         chunk[valid:] = actions[end - 1]
-        chunk = (chunk - self.stats.action_mean) / self.stats.action_std
         mask[:valid] = 1.0
         return (
             image_batch,
-            torch.from_numpy(state_batch).float(),
-            torch.from_numpy(chunk).float(),
-            torch.from_numpy(mask).float(),
+            state_batch,
+            chunk,
+            mask,
         )
 
 
@@ -96,13 +100,18 @@ class SmallSequenceTransformer(nn.Module):
         num_heads: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
+        cameras="agentview",
+        observation_mode="both",
     ):
         super().__init__()
         self.history_length = history_length
         self.chunk_size = chunk_size
+        self.image_channels = camera_channels(cameras)
+        from bc import validate_observation_mode
+        self.observation_mode = validate_observation_mode(observation_mode, cameras)
         self.action_dim = action_dim
         self.image_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
+            nn.Conv2d(max(self.image_channels, 3), 32, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
@@ -111,7 +120,7 @@ class SmallSequenceTransformer(nn.Module):
             nn.Linear(state_dim, 64), nn.ReLU(inplace=True),
         )
         self.token_projection = nn.Sequential(
-            nn.Linear(128 + 64, d_model), nn.LayerNorm(d_model), nn.ReLU(inplace=True)
+            nn.Linear((128 if self.image_channels else 0) + 64, d_model), nn.LayerNorm(d_model), nn.ReLU(inplace=True)
         )
         # 两类可学习 token：历史位置编码 + 未来 K 步 action query。
         self.observation_position_embedding = nn.Parameter(
@@ -136,8 +145,12 @@ class SmallSequenceTransformer(nn.Module):
         )
 
     def forward(self, images: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+        if self.observation_mode == "image":
+            states = torch.zeros_like(states)
+        if self.observation_mode == "state":
+            images = torch.zeros_like(images)
         batch, history = images.shape[:2]
-        image_features = self.image_encoder(images.reshape(batch * history, *images.shape[2:]))
+        image_features = self.image_encoder(images.reshape(batch * history, *images.shape[2:])) if self.image_channels else states.new_empty(batch * history, 0)
         state_features = self.state_encoder(states.reshape(batch * history, -1))
         observation_tokens = self.token_projection(
             torch.cat([image_features, state_features], dim=-1)

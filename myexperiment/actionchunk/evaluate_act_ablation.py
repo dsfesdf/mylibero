@@ -15,17 +15,18 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from rollout_act import ABLATIONS, load_model, run_rollouts
+from experiment_protocol import add_rollout_args
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run ACT ablation rollouts with shared settings")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--flow-steps", type=int, default=None)
     parser.add_argument("--benchmark", default="LIBERO_SPATIAL")
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--num-rollouts", type=int, default=40)
-    parser.add_argument("--all-init-states", action="store_true")
-    parser.add_argument("--init-state-offset", type=int, default=0)
-    parser.add_argument("--max-steps", type=int, default=600)
+    parser.add_argument("--max-steps", type=int, default=270)
     parser.add_argument("--output", default="myexperiment/actionchunk/outputs/act_ablation")
     parser.add_argument("--temporal-aggregation", action="store_true")
     parser.add_argument("--aggregation-decay", type=float, default=0.2)
@@ -43,13 +44,17 @@ def parse_args():
         metavar=("OBJECT_A", "OBJECT_B"),
     )
     parser.add_argument("--distance-thresholds", default=None)
-    parser.add_argument("--settle-steps", type=int, default=5)
+    add_rollout_args(parser, include_seed=False)
     return parser.parse_args()
 
 
 def clone_args(args, ablation, output):
     return Namespace(
         checkpoint=args.checkpoint,
+        seed=args.seed,
+        sampling_seed=args.sampling_seed,
+        init_state_indices=args.init_state_indices,
+        flow_steps=args.flow_steps,
         benchmark=args.benchmark,
         task_id=args.task_id,
         num_rollouts=args.num_rollouts,

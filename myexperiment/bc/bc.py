@@ -32,6 +32,41 @@ class NormalizationStats:
 
 PathLike = Union[str, Path]
 
+# 顺序也是模型输入通道的顺序；checkpoint 必须保存此选项。
+CAMERAS = {
+    "none": (), "agentview": ("agentview",),
+    "wrist": ("wrist",), "both": ("agentview", "wrist"),
+}
+DATA_CAMERA_KEYS = {"agentview": "agentview_rgb", "wrist": "eye_in_hand_rgb"}
+ENV_CAMERA_KEYS = {"agentview": "agentview_image", "wrist": "robot0_eye_in_hand_image"}
+
+
+def camera_channels(cameras="agentview"):
+    if cameras not in CAMERAS:
+        raise ValueError(f"未知 cameras={cameras}，可选 {list(CAMERAS)}")
+    return 3 * len(CAMERAS[cameras])
+
+
+def validate_observation_mode(mode, cameras):
+    if mode not in {"both", "image", "state"}:
+        raise ValueError("observation_mode 必须为 both/image/state")
+    if mode == "image" and not camera_channels(cameras):
+        raise ValueError("纯视觉模式至少需要一路相机")
+    return "state" if not camera_channels(cameras) else mode
+
+
+def observation_image(obs, image_size, cameras="agentview"):
+    """训练/rollout 使用同一相机顺序；零相机返回空通道，绝不读取图像。"""
+    camera_channels(cameras)
+    views = []
+    for camera in CAMERAS[cameras]:
+        key = ENV_CAMERA_KEYS[camera]
+        if key not in obs:
+            raise KeyError(f"环境缺少相机 {key}，已有字段: {list(obs)}")
+        image = torch.from_numpy(np.ascontiguousarray(obs[key])).permute(2, 0, 1).float() / 255.0
+        views.append(F.interpolate(image[None], (image_size, image_size), mode="bilinear", align_corners=False)[0])
+    return torch.cat(views, dim=0) if views else torch.empty(0, image_size, image_size)
+
 
 def list_demos(hdf5_path: PathLike) -> List[str]:
     """返回 HDF5 中按 demo 编号排序的轨迹名。"""
@@ -39,14 +74,17 @@ def list_demos(hdf5_path: PathLike) -> List[str]:
         return sorted(handle["data"].keys(), key=lambda name: int(name.split("_")[-1]))
 
 
-def read_demo_arrays(hdf5_path: PathLike, demo_name: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def read_demo_arrays(hdf5_path: PathLike, demo_name: str, cameras="agentview") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """读取一个 demo，并将 h5py 数据复制成普通 NumPy 数组。"""
     with h5py.File(hdf5_path, "r") as handle:
         demo = handle["data"][demo_name]
-        images = np.asarray(demo["obs"]["agentview_rgb"], dtype=np.uint8)
+        camera_channels(cameras)
+        views = [np.asarray(demo["obs"][DATA_CAMERA_KEYS[camera]], dtype=np.uint8)
+                 for camera in CAMERAS[cameras]]
         joint_states = np.asarray(demo["obs"]["joint_states"], dtype=np.float32)
         gripper_states = np.asarray(demo["obs"]["gripper_states"], dtype=np.float32)
         actions = np.asarray(demo["actions"], dtype=np.float32)
+        images = np.concatenate(views, axis=-1) if views else np.empty((len(actions), 1, 1, 0), dtype=np.uint8)
     states = np.concatenate([joint_states, gripper_states], axis=-1)
     if not (len(images) == len(states) == len(actions)):
         raise ValueError(f"时间长度不一致: images={len(images)}, states={len(states)}, actions={len(actions)}")
@@ -57,7 +95,7 @@ def compute_stats(hdf5_path: PathLike, demo_names: Sequence[str]) -> Normalizati
     """只用训练 demos 计算 state/action 的均值和标准差。"""
     states, actions = [], []
     for demo_name in demo_names:
-        _, state, action = read_demo_arrays(hdf5_path, demo_name)
+        _, state, action = read_demo_arrays(hdf5_path, demo_name, cameras="none")
         states.append(state)
         actions.append(action)
     state_all, action_all = np.concatenate(states), np.concatenate(actions)
@@ -74,13 +112,14 @@ def prepare_demo_tensors(
     demo_name: str,
     stats: NormalizationStats,
     image_size: int,
+    cameras="agentview",
 ):
     """一次性读取、resize、归一化一个 demo，供训练 dataset 复用。"""
-    images, states, actions = read_demo_arrays(hdf5_path, demo_name)
+    images, states, actions = read_demo_arrays(hdf5_path, demo_name, cameras)
     image_tensor = torch.from_numpy(images).permute(0, 3, 1, 2).float().div_(255.0)
     image_tensor = F.interpolate(
         image_tensor, (image_size, image_size), mode="bilinear", align_corners=False
-    )
+    ) if camera_channels(cameras) else torch.empty(len(actions), 0, image_size, image_size)
     state_tensor = torch.from_numpy(
         ((states - stats.state_mean) / stats.state_std).astype(np.float32, copy=False)
     )
@@ -92,13 +131,13 @@ def prepare_demo_tensors(
 
 class LIBEROFrameDataset(Dataset):
     """将指定 demos 展平为逐帧监督样本。"""
-    def __init__(self, hdf5_path: PathLike, demo_names: Sequence[str], stats: NormalizationStats, image_size: int = 84):
+    def __init__(self, hdf5_path: PathLike, demo_names: Sequence[str], stats: NormalizationStats, image_size: int = 84, cameras="agentview"):
         self.hdf5_path, self.stats, self.image_size = str(hdf5_path), stats, image_size
         self.demos = {}
         self.index: List[Tuple[str, int]] = []
         for demo_name in demo_names:
             self.demos[demo_name] = prepare_demo_tensors(
-                self.hdf5_path, demo_name, self.stats, self.image_size
+                self.hdf5_path, demo_name, self.stats, self.image_size, cameras
             )
             length = self.demos[demo_name][2].shape[0]
             self.index.extend((demo_name, t) for t in range(length))
@@ -114,10 +153,12 @@ class LIBEROFrameDataset(Dataset):
 
 class SmallVisualBC(nn.Module):
     """CNN 提取图像特征，MLP 提取状态特征，拼接后回归 action。"""
-    def __init__(self, state_dim: int = 9, action_dim: int = 7):
+    def __init__(self, state_dim: int = 9, action_dim: int = 7, cameras="agentview", observation_mode="both"):
         super().__init__()
+        self.image_channels = camera_channels(cameras)
+        self.observation_mode = validate_observation_mode(observation_mode, cameras)
         self.image_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
+            nn.Conv2d(max(self.image_channels, 3), 32, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
         ##更大池化
@@ -130,7 +171,7 @@ class SmallVisualBC(nn.Module):
             nn.AdaptiveAvgPool2d((2, 2)), nn.Flatten(),
         )
         self.state_encoder = nn.Sequential(nn.Linear(state_dim, 64), nn.ReLU(inplace=True), nn.Linear(64, 64), nn.ReLU(inplace=True))
-        self.action_head = nn.Sequential(nn.Linear(576, 128), nn.ReLU(inplace=True), nn.Linear(128, action_dim))
+        self.action_head = nn.Sequential(nn.Linear((512 if self.image_channels else 0) + 64, 128), nn.ReLU(inplace=True), nn.Linear(128, action_dim))
         #     nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
         # )
         # self.state_encoder = nn.Sequential(nn.Linear(state_dim, 64), nn.ReLU(inplace=True), nn.Linear(64, 64), nn.ReLU(inplace=True))
@@ -138,4 +179,11 @@ class SmallVisualBC(nn.Module):
 
 
     def forward(self, image: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        return self.action_head(torch.cat([self.image_encoder(image), self.state_encoder(state)], dim=-1))
+        # 保持旧权重结构；纯视觉时不读取真实 state，固定零占位仅产生常量特征。
+        if self.observation_mode == "image":
+            state = torch.zeros_like(state)
+        if self.observation_mode == "state":
+            image = torch.zeros_like(image)
+        state_features = self.state_encoder(state)
+        features = torch.cat([self.image_encoder(image), state_features], dim=-1) if self.image_channels else state_features
+        return self.action_head(features)

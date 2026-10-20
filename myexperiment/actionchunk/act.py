@@ -1,4 +1,7 @@
-"""一个可训练、可推理的精简完整 ACT 框架。
+"""ACT 核心框架和可选的条件 Flow Matching 动作头。
+
+action_head_type=transformer 保留 CVAE 路径；deterministic 只用观测回归动作；flow 使用纯观测 memory，
+通过 flow_loss 训练速度场，再从噪声积分生成动作，不运行 posterior/KL。
 
 实现对应 ACT 的核心训练链路：
 
@@ -25,6 +28,8 @@ for path in (HERE, BC_DIR):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+from bc import camera_channels
+from flow_matching import FlowMatchingHead
 from action_chunking import masked_chunk_mse
 from sequence_transformer import LIBEROSequenceChunkDataset
 
@@ -62,6 +67,9 @@ class ACT(nn.Module):
         visual_representation: str = "global_pool",
         spatial_grid: int = 6,
         observation_mode: str = "both",
+        cameras="agentview",
+        action_head_type="transformer",
+        flow_steps=10,
     ):
         super().__init__()
         if d_model % num_heads != 0:
@@ -72,6 +80,16 @@ class ACT(nn.Module):
             raise ValueError("observation_mode 必须是 both、image 或 state")
         if spatial_grid < 1:
             raise ValueError("spatial_grid 必须 >= 1")
+        self.image_channels = camera_channels(cameras)
+        self.cameras = cameras
+        if not self.image_channels:
+            if observation_mode == "image":
+                raise ValueError("零相机不能使用 observation_mode=image")
+            observation_mode = "state"
+        if action_head_type not in {"transformer", "deterministic", "flow"} or flow_steps < 1:
+            raise ValueError("action_head_type 必须是 transformer/deterministic/flow，flow_steps >= 1")
+        self.action_head_type = action_head_type
+        self.flow_steps = flow_steps
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.history_length = history_length
@@ -85,7 +103,7 @@ class ACT(nn.Module):
         # 保留 global_pool + both 的层命名和结构，以兼容已有 ACT checkpoint。
         if visual_representation == "global_pool":
             self.image_encoder = nn.Sequential(
-                nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
+                nn.Conv2d(max(self.image_channels, 3), 32, 5, 2, 2), nn.ReLU(inplace=True),
                 nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
                 nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
                 nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(),
@@ -112,7 +130,7 @@ class ACT(nn.Module):
             visual_token_count = 0
         else:
             self.image_encoder = nn.Sequential(
-                nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
+                nn.Conv2d(max(self.image_channels, 3), 32, 5, 2, 2), nn.ReLU(inplace=True),
                 nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
                 nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
             )
@@ -141,24 +159,31 @@ class ACT(nn.Module):
         self.tokens_per_frame = tokens_per_frame
         self.observation_token_count = history_length * tokens_per_frame
 
-        # CVAE posterior q(z | observation, future action chunk)。
-        self.posterior_action_projection = nn.Linear(action_dim, d_model)
-        self.posterior_state_projection = nn.Linear(state_dim, d_model)
-        self.posterior_cls = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.posterior_position = nn.Parameter(torch.zeros(1, chunk_size + 3, d_model))
-        nn.init.normal_(self.posterior_cls, std=0.02)
-        nn.init.normal_(self.posterior_position, std=0.02)
-        posterior_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads, dim_feedforward=4 * d_model,
-            dropout=dropout, activation="gelu", batch_first=True,
-        )
-        self.posterior_encoder = nn.TransformerEncoder(posterior_layer, num_layers=num_layers)
-        self.posterior_stats = nn.Linear(d_model, 2 * latent_dim)
+        if action_head_type == "flow":
+            # 独立的条件速度场分支，不经过含真实动作的 CVAE posterior。
+            self.flow_head = FlowMatchingHead(action_dim, chunk_size, d_model, num_heads, num_layers, dropout)
+            return
 
-        # decoder memory = observation tokens + 1 个 latent token。
-        self.latent_projection = nn.Linear(latent_dim, d_model)
+        if action_head_type == "transformer":
+            # 仅 CVAE 分支创建后验与 latent 参数；deterministic 完全不接触未来标签。
+            self.posterior_action_projection = nn.Linear(action_dim, d_model)
+            self.posterior_state_projection = nn.Linear(state_dim, d_model)
+            self.posterior_cls = nn.Parameter(torch.zeros(1, 1, d_model))
+            self.posterior_position = nn.Parameter(torch.zeros(1, chunk_size + 3, d_model))
+            nn.init.normal_(self.posterior_cls, std=0.02)
+            nn.init.normal_(self.posterior_position, std=0.02)
+            posterior_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=num_heads, dim_feedforward=4 * d_model,
+                dropout=dropout, activation="gelu", batch_first=True,
+            )
+            self.posterior_encoder = nn.TransformerEncoder(posterior_layer, num_layers=num_layers)
+            self.posterior_stats = nn.Linear(d_model, 2 * latent_dim)
+            self.latent_projection = nn.Linear(latent_dim, d_model)
+
+        # 相同 observation encoder、query、decoder 和 MSE readout。
+        # 确定性分支 memory 只有 observation，训练/推理均无 latent token。
         self.memory_position = nn.Parameter(
-            torch.zeros(1, self.observation_token_count + 1, d_model)
+            torch.zeros(1, self.observation_token_count + (action_head_type == "transformer"), d_model)
         )
         nn.init.normal_(self.memory_position, std=0.02)
         self.action_queries = nn.Parameter(torch.zeros(1, chunk_size, d_model))
@@ -184,7 +209,7 @@ class ACT(nn.Module):
         flat_states = states.reshape(batch * history, -1)
 
         if self.visual_representation == "global_pool":
-            image_features = self.image_encoder(flat_images)
+            image_features = self.image_encoder(flat_images) if self.observation_mode != "state" else None
             state_features = self.state_encoder(flat_states)
             if self.observation_mode == "both":
                 inputs = torch.cat([image_features, state_features], dim=-1)
@@ -237,7 +262,8 @@ class ACT(nn.Module):
         # 不符合 q(z | observation, action) 的条件 VAE 定义。
         observation_token = observation_tokens.mean(dim=1, keepdim=True)
         # 使用最新一帧 state 作为 qpos token；未来动作 token 提供 demonstration 信息。
-        state_token = self.posterior_state_projection(states[:, -1]).unsqueeze(1)
+        posterior_state = states[:, -1] if self.observation_mode != "image" else torch.zeros_like(states[:, -1])
+        state_token = self.posterior_state_projection(posterior_state).unsqueeze(1)
         action_tokens = self.posterior_action_projection(actions)
         tokens = torch.cat([cls, observation_token, state_token, action_tokens], dim=1)
         tokens = tokens + self.posterior_position[:, : tokens.size(1)]
@@ -258,10 +284,12 @@ class ACT(nn.Module):
         std = torch.exp(0.5 * logvar)
         return mean + std * torch.randn_like(std)
 
-    def decode(self, observation_tokens: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+    def decode(self, observation_tokens: torch.Tensor, latent: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch = observation_tokens.size(0)
-        latent_token = self.latent_projection(latent).unsqueeze(1)
-        memory = torch.cat([observation_tokens, latent_token], dim=1)
+        memory = observation_tokens
+        if self.action_head_type == "transformer":
+            latent_token = self.latent_projection(latent).unsqueeze(1)
+            memory = torch.cat([observation_tokens, latent_token], dim=1)
         memory = memory + self.memory_position[:, : memory.size(1)]
         queries = self.action_queries.expand(batch, -1, -1) + self.action_position
         decoded = self.decoder(queries, memory)
@@ -274,8 +302,21 @@ class ACT(nn.Module):
         actions: Optional[torch.Tensor] = None,
         action_mask: Optional[torch.Tensor] = None,
     ):
-        """训练返回 ``pred, mean, logvar``；推理 actions=None 时使用 z=0。"""
+        """返回 ``pred, mean, logvar``。
+
+        transformer 训练可传 actions；推理使用 z=0。
+        deterministic 训练/推理均不读取 actions，且没有 CVAE/latent 参数。
+        flow 此接口生成动作，mean/logvar 为零占位；训练应调用 flow_loss。
+        """
         observation_tokens = self.encode_observation(images, states)
+        if self.action_head_type == "flow":
+            prediction = self.flow_head.sample(observation_tokens, self.flow_steps)
+            zero = states.new_zeros(images.size(0), self.latent_dim)
+            return prediction, zero, zero
+        if self.action_head_type == "deterministic":
+            # 即使调用方传入标签，也不送进模型；标签只在外部 MSE loss 使用。
+            zero = states.new_zeros(images.size(0), self.latent_dim)
+            return self.decode(observation_tokens), zero, zero
         if actions is not None:
             mean, logvar = self.posterior(observation_tokens, states, actions, action_mask)
             latent = self.reparameterize(mean, logvar)
@@ -287,9 +328,14 @@ class ACT(nn.Module):
         prediction = self.decode(observation_tokens, latent)
         return prediction, mean, logvar
 
+    def flow_loss(self, images, states, actions, mask):
+        if self.action_head_type != "flow":
+            raise ValueError("flow_loss 仅用于 flow 分支")
+        return self.flow_head.loss(actions, mask, self.encode_observation(images, states))
+
     @torch.no_grad()
     def predict(self, images: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
-        """推理接口：不需要未来动作，返回归一化的 ``[B,K,action_dim]``。"""
+        """纯观测推理：CVAE 用 z=0，确定性头直接回归，flow 从噪声积分。"""
         prediction, _, _ = self(images, states, actions=None, action_mask=None)
         return prediction
 

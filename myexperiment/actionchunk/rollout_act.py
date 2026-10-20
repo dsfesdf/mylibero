@@ -19,7 +19,8 @@ for path in (HERE, BC_DIR):
         sys.path.insert(0, str(path))
 
 from act import ACT
-from bc import NormalizationStats
+from bc import NormalizationStats, observation_image
+from experiment_protocol import add_rollout_args, rollout_indices, seed_episode, rollout_metadata, set_seed
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 from rollout_action_chunking import choose_action
@@ -38,12 +39,12 @@ ABLATIONS = (
 def parse_args():
     parser = argparse.ArgumentParser(description="Roll out ACT in LIBERO")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--seed", type=int, default=0, help="固定 flow 采样和环境随机性")
+    parser.add_argument("--flow-steps", type=int, default=None, help="可覆盖 checkpoint 的积分步数")
     parser.add_argument("--benchmark", default="LIBERO_SPATIAL")
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--num-rollouts", type=int, default=5)
-    parser.add_argument("--all-init-states", action="store_true")
-    parser.add_argument("--init-state-offset", type=int, default=0)
-    parser.add_argument("--max-steps", type=int, default=600)
+    parser.add_argument("--max-steps", type=int, default=270)
     parser.add_argument("--output", default="myexperiment/actionchunk/outputs/act_rollout")
     parser.add_argument("--temporal-aggregation", action="store_true")
     parser.add_argument("--aggregation-decay", type=float, default=0.2)
@@ -60,15 +61,12 @@ def parse_args():
         default=None,
         help="两个米制阈值，例如 0.12,0.24；默认使用所有 init states 的三分位数",
     )
-    parser.add_argument("--settle-steps", type=int, default=5)
+    add_rollout_args(parser, include_seed=False)
     return parser.parse_args()
 
 
-def observation_to_tensors(obs, stats, image_size):
-    image = torch.from_numpy(obs["agentview_image"]).permute(2, 0, 1).float() / 255.0
-    image = torch.nn.functional.interpolate(
-        image[None], (image_size, image_size), mode="bilinear", align_corners=False
-    )[0]
+def observation_to_tensors(obs, stats, image_size, cameras="agentview"):
+    image = observation_image(obs, image_size, cameras)
     state = np.concatenate([obs["robot0_joint_pos"], obs["robot0_gripper_qpos"]]).astype(np.float32)
     state = (state - stats.state_mean) / stats.state_std
     return image, torch.from_numpy(state).float()
@@ -105,6 +103,8 @@ def load_model(checkpoint_path, device):
         visual_representation=config.get("visual_representation", "global_pool"),
         spatial_grid=config.get("spatial_grid", 6),
         observation_mode=config.get("observation_mode", "both"),
+        cameras=config.get("cameras", "agentview"),
+        action_head_type=config.get("action_head", "transformer"), flow_steps=config.get("flow_steps", 10),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -174,6 +174,12 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
     if model is None or checkpoint is None or stats is None:
         model, checkpoint, stats = load_model(checkpoint_path, device)
     config = checkpoint["config"]
+    seed = getattr(args, "seed", 0)
+    set_seed(seed)
+    if getattr(args, "flow_steps", None) is not None:
+        if args.flow_steps < 1:
+            raise ValueError("flow-steps 必须 >= 1")
+        model.flow_steps = args.flow_steps
 
     output_dir = Path(args.output).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -187,9 +193,8 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
     task = benchmark.get_task(args.task_id)
     init_states = benchmark.get_task_init_states(args.task_id)
     init_count = len(init_states)
-    num_rollouts = init_count if args.all_init_states else args.num_rollouts
-    if num_rollouts < 1:
-        raise ValueError("num-rollouts 必须 >= 1")
+    indices = rollout_indices(args, init_count)
+    num_rollouts = len(indices)
 
     distance_env = OffScreenRenderEnv(
         bddl_file_name=benchmark.get_task_bddl_file_path(args.task_id),
@@ -225,19 +230,22 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
         rollout_records = []
         image_size = config.get("image_size", 84)
 
-        for rollout_id in range(num_rollouts):
-            init_index = (args.init_state_offset + rollout_id) % init_count
+        for rollout_id, init_index in enumerate(indices):
+            seed_episode(env, args, init_index)
             target_obs = _settle(env, init_states[init_index], args.settle_steps)
             donor_index = (init_index + 1) % init_count
             donor_obs = None
             if donor_env is not None:
+                seed_episode(donor_env, args, donor_index)
                 donor_obs = _settle(donor_env, init_states[donor_index], args.settle_steps)
+                # donor 环境不能改变当前策略的采样随机性。
+                seed_episode(env, args, init_index)
 
-            target_image, target_state = observation_to_tensors(target_obs, stats, image_size)
+            target_image, target_state = observation_to_tensors(target_obs, stats, image_size, config.get("cameras", "agentview"))
             if donor_obs is None:
                 input_image = target_image
             else:
-                input_image, _ = observation_to_tensors(donor_obs, stats, image_size)
+                input_image, _ = observation_to_tensors(donor_obs, stats, image_size, config.get("cameras", "agentview"))
             observations = deque(
                 [(input_image, target_state)] * history_length,
                 maxlen=history_length,
@@ -270,11 +278,11 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
                 target_obs, _, done, _ = env.step(np.clip(action, -1.0, 1.0))
                 if donor_env is not None:
                     donor_obs, _, _, _ = donor_env.step(np.clip(action, -1.0, 1.0))
-                target_image, target_state = observation_to_tensors(target_obs, stats, image_size)
+                target_image, target_state = observation_to_tensors(target_obs, stats, image_size, config.get("cameras", "agentview"))
                 if donor_obs is None:
                     input_image = target_image
                 else:
-                    input_image, _ = observation_to_tensors(donor_obs, stats, image_size)
+                    input_image, _ = observation_to_tensors(donor_obs, stats, image_size, config.get("cameras", "agentview"))
                 observations.append((input_image, target_state))
                 frames.append(target_obs["agentview_image"][::-1])
                 if done:
@@ -334,11 +342,16 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
         "visual_representation": config.get("visual_representation", "global_pool"),
         "spatial_grid": config.get("spatial_grid", 1),
         "observation_mode": config.get("observation_mode", "both"),
+        "cameras": config.get("cameras", "agentview"),
+        "action_head": config.get("action_head", "transformer"),
+        "flow_steps": model.flow_steps,
+        "seed": seed,
         "input_ablation": args.input_ablation,
         "temporal_aggregation": args.temporal_aggregation,
         "aggregation_decay": args.aggregation_decay,
         "history_size": history_size,
         "num_rollouts": num_rollouts,
+        "max_steps": args.max_steps,
         "init_state_offset": args.init_state_offset,
         "distance_objects": list(args.distance_objects),
         "distance_thresholds": thresholds,
@@ -350,6 +363,7 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
         "mean_candidate_count": float(np.mean(candidate_counts)) if candidate_counts else 0.0,
         "by_distance_bucket": bucket_metrics,
         "rollouts": rollout_records,
+        **rollout_metadata(args, indices),
     }
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8"

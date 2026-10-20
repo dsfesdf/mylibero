@@ -40,18 +40,19 @@ def main():
     elif args.split == "val": demos = checkpoint["val_demos"]
     else: demos = list_demos(dataset_path)
     cfg = checkpoint["config"]
-    dataset = LIBEROChunkDataset(dataset_path, demos, stats, cfg["chunk_size"], cfg.get("image_size", 84))
+    dataset = LIBEROChunkDataset(dataset_path, demos, stats, cfg["chunk_size"], cfg.get("image_size", 84), cameras=cfg.get("cameras", "agentview"))
     loader = DataLoader(dataset, args.batch_size, shuffle=False, num_workers=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SmallChunkBC(9, 7, cfg["chunk_size"], cfg.get("pool_size", 2)).to(device)
+    model = SmallChunkBC(9, 7, cfg["chunk_size"], cfg.get("pool_size", 2), cameras=cfg.get("cameras", "agentview"), observation_mode=cfg.get("observation_mode", "both")).to(device)
     model.load_state_dict(checkpoint["model"]); model.eval()
-    total, count = 0.0, 0
+    total, count, valid_count = 0.0, 0, 0.0
     with torch.no_grad():
         for image, state, target, mask in loader:
             loss = masked_chunk_mse(model(image.to(device), state.to(device)), target.to(device), mask.to(device))
-            total += loss.item() * image.size(0); count += image.size(0)
-    result = {"checkpoint": str(checkpoint_path), "dataset": str(dataset_path), "split": args.split,
-              "chunk_size": cfg["chunk_size"], "num_frames": count, "masked_normalized_mse": total / max(count, 1)}
+            valid = mask.sum().item()
+            total += loss.item() * valid; valid_count += valid; count += image.size(0)
+    result = {"checkpoint": str(checkpoint_path), "dataset": str(dataset_path), "split": args.split, "cameras": cfg.get("cameras", "agentview"),
+              "chunk_size": cfg["chunk_size"], "num_frames": count, "masked_normalized_mse": total / max(valid_count, 1)}
     print(json.dumps(result, indent=2, ensure_ascii=False))
     if args.output:
         output = Path(args.output).expanduser().resolve(); output.parent.mkdir(parents=True, exist_ok=True)

@@ -49,10 +49,10 @@ def main():
         demo_names = list_demos(dataset_path)
 
     image_size = checkpoint["config"].get("image_size", 84)
-    dataset = LIBEROFrameDataset(dataset_path, demo_names, stats, image_size)
+    dataset = LIBEROFrameDataset(dataset_path, demo_names, stats, image_size, cameras=checkpoint["config"].get("cameras", "agentview"))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SmallVisualBC(state_dim=len(stats.state_mean), action_dim=len(stats.action_mean)).to(device)
+    model = SmallVisualBC(state_dim=len(stats.state_mean), action_dim=len(stats.action_mean), cameras=checkpoint["config"].get("cameras", "agentview"), observation_mode=checkpoint["config"].get("observation_mode", "both")).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
@@ -81,6 +81,7 @@ def main():
     raw_mse_by_dim = raw_squared_error / count
     metrics = {
         "checkpoint": str(checkpoint_path),
+        "cameras": checkpoint["config"].get("cameras", "agentview"),
         "dataset": str(dataset_path),
         "split": args.split,
         "num_demos": len(demo_names),

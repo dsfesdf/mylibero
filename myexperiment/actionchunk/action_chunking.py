@@ -25,7 +25,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset
 
-from bc import NormalizationStats, PathLike, prepare_demo_tensors
+from bc import NormalizationStats, PathLike, prepare_demo_tensors, camera_channels
 
 
 class LIBEROChunkDataset(Dataset):
@@ -38,6 +38,7 @@ class LIBEROChunkDataset(Dataset):
         stats: NormalizationStats,
         chunk_size: int = 10,
         image_size: int = 84,
+        cameras="agentview",
     ):
         if chunk_size < 1:
             raise ValueError("chunk_size 必须 >= 1")
@@ -49,7 +50,7 @@ class LIBEROChunkDataset(Dataset):
         self.index: List[Tuple[str, int]] = []
         for demo_name in demo_names:
             self.demos[demo_name] = prepare_demo_tensors(
-                self.hdf5_path, demo_name, self.stats, self.image_size
+                self.hdf5_path, demo_name, self.stats, self.image_size, cameras
             )
             length = self.demos[demo_name][2].shape[0]
             self.index.extend((demo_name, t) for t in range(length))
@@ -82,18 +83,21 @@ class LIBEROChunkDataset(Dataset):
 class SmallChunkBC(nn.Module):
     """复用小 CNN/MLP 编码器，一次输出 chunk_size * action_dim 个动作值。"""
 
-    def __init__(self, state_dim: int = 9, action_dim: int = 7, chunk_size: int = 10, pool_size: int = 2):
+    def __init__(self, state_dim: int = 9, action_dim: int = 7, chunk_size: int = 10, pool_size: int = 2, cameras="agentview", observation_mode="both"):
         super().__init__()
+        self.image_channels = camera_channels(cameras)
+        from bc import validate_observation_mode
+        self.observation_mode = validate_observation_mode(observation_mode, cameras)
         self.action_dim = action_dim
         self.chunk_size = chunk_size
         self.pool_size = pool_size
         self.image_encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 5, 2, 2), nn.ReLU(inplace=True),
+            nn.Conv2d(max(self.image_channels, 3), 32, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, 5, 2, 2), nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((pool_size, pool_size)), nn.Flatten(),
         )
-        image_dim = 128 * pool_size * pool_size
+        image_dim = 128 * pool_size * pool_size if self.image_channels else 0
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, 64), nn.ReLU(inplace=True),
             nn.Linear(64, 64), nn.ReLU(inplace=True),
@@ -104,7 +108,12 @@ class SmallChunkBC(nn.Module):
         )
 
     def forward(self, image: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        features = torch.cat([self.image_encoder(image), self.state_encoder(state)], dim=-1)
+        if self.observation_mode == "image":
+            state = torch.zeros_like(state)
+        if self.observation_mode == "state":
+            image = torch.zeros_like(image)
+        state_features = self.state_encoder(state)
+        features = torch.cat([self.image_encoder(image), state_features], dim=-1) if self.image_channels else state_features
         return self.action_head(features).view(-1, self.chunk_size, self.action_dim)
 
 

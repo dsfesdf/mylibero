@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
 from pathlib import Path
 
@@ -14,11 +13,11 @@ for path in (HERE, BC_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from bc import compute_stats, list_demos
+from experiment_protocol import split_demos, set_seed
 from sequence_transformer import LIBEROSequenceChunkDataset, SmallSequenceTransformer, masked_chunk_mse
 
 
@@ -39,16 +38,12 @@ def parse_args():
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=0, help="只控制模型初始化、shuffle 和训练随机性")
     p.add_argument("--split-seed", type=int, default=0, help="只控制 train/val demo 划分")
+    p.add_argument("--split-file", default=None)
     p.add_argument("--image-size", type=int, default=84)
+    p.add_argument("--cameras", choices=["none", "agentview", "wrist", "both"], default="agentview")
+    p.add_argument("--observation-mode", choices=["both", "image", "state"], default="both")
     p.add_argument("--num-workers", type=int, default=0, help="dataset 已缓存到内存；多 worker 会复制缓存")
     return p.parse_args()
-
-
-def set_seed(seed):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def run_epoch(model, loader, optimizer, device):
@@ -62,7 +57,8 @@ def run_epoch(model, loader, optimizer, device):
             loss = masked_chunk_mse(model(images, states), target, mask)
             if training:
                 optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
-        total += loss.item() * images.size(0); count += images.size(0)
+        valid = mask.sum().item()
+        total += loss.item() * valid; count += valid
     return total / max(count, 1)
 
 
@@ -72,13 +68,10 @@ def main():
     output_dir = Path(args.output).expanduser().resolve(); output_dir.mkdir(parents=True, exist_ok=True)
     if not dataset_path.is_file(): raise FileNotFoundError(f"找不到数据集: {dataset_path}")
     demos = list_demos(dataset_path)
-    if len(demos) < 2: raise ValueError("至少需要 2 个 demo")
-    split_rng = random.Random(args.split_seed); split_rng.shuffle(demos)
-    val_count = max(1, int(round(len(demos) * args.val_ratio)))
-    val_demos, train_demos = demos[:val_count], demos[val_count:]
+    train_demos, val_demos = split_demos(demos, args.val_ratio, args.split_seed, args.split_file, output_dir)
     stats = compute_stats(dataset_path, train_demos)
-    train_set = LIBEROSequenceChunkDataset(dataset_path, train_demos, stats, args.history_length, args.chunk_size, args.image_size)
-    val_set = LIBEROSequenceChunkDataset(dataset_path, val_demos, stats, args.history_length, args.chunk_size, args.image_size)
+    train_set = LIBEROSequenceChunkDataset(dataset_path, train_demos, stats, args.history_length, args.chunk_size, args.image_size, cameras=args.cameras)
+    val_set = LIBEROSequenceChunkDataset(dataset_path, val_demos, stats, args.history_length, args.chunk_size, args.image_size, cameras=args.cameras)
     loader_generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_set, args.batch_size, shuffle=True, num_workers=args.num_workers,
@@ -90,6 +83,7 @@ def main():
     model = SmallSequenceTransformer(
         state_dim=9, action_dim=7, history_length=args.history_length, chunk_size=args.chunk_size,
         d_model=args.d_model, num_heads=args.num_heads, num_layers=args.num_layers, dropout=args.dropout,
+        cameras=args.cameras, observation_mode=args.observation_mode,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val, history = float("inf"), []
@@ -105,6 +99,7 @@ def main():
                 best_val = val_loss
                 torch.save({
                     "model": model.state_dict(), "stats": stats.to_dict(), "config": vars(args),
+                    "selection_metric": "val_mse", "best_epoch": epoch, "best_val_mse": best_val,
                     "train_demos": train_demos, "val_demos": val_demos,
                 }, output_dir / "best.pt")
                 best_checkpoint_saved = True
