@@ -24,7 +24,7 @@ MODELS = {
 DEFAULT_MODELS = [name for name in MODELS if name != "bc"]
 
 
-def parse_args():
+def parse_args(defaults=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", default=None, help="训练必填；rollout 阶段从 suite.json 恢复配置")
     p.add_argument("--output-root", default="myexperiment/results_v2/vision_suite")
@@ -51,10 +51,15 @@ def parse_args():
     p.add_argument("--rollout-seed", type=int, default=0)
     p.add_argument("--sampling-seed", type=int, default=123)
     p.add_argument("--aggregation-decay", type=float, default=.2)
+    p.add_argument("--distance-buckets", action="store_true", help="Sequence/ACT 共用近中远距离统计")
+    p.add_argument("--distance-objects", nargs=2, default=["akita_black_bowl_1", "plate_1"])
+    p.add_argument("--distance-thresholds", default=None)
     p.add_argument("--policies", nargs="+", choices=["first", "ta"], default=["first", "ta"])
     p.add_argument("--stage", choices=["all", "train", "rollout"], default="all")
     p.add_argument("--gpu", default=None, help="CUDA_VISIBLE_DEVICES，例：2；不指定则继承当前环境")
     p.add_argument("--execute", action="store_true")
+    if defaults:
+        p.set_defaults(**defaults)
     return p.parse_args()
 
 
@@ -107,6 +112,12 @@ def build_jobs(args):
                                 "--history-size", str(chunk)]
                     if head == "flow":
                         cmd += ["--flow-steps", str(args.flow_steps)]
+                    if args.distance_buckets and script in ("sequence_transformer", "act"):
+                        if script == "sequence_transformer":
+                            cmd += ["--distance-buckets"]
+                        cmd += ["--distance-objects"] + args.distance_objects
+                        if args.distance_thresholds is not None:
+                            cmd += ["--distance-thresholds", args.distance_thresholds]
                     jobs.append(dict(kind="rollout", model=name, camera=camera, seed=seed,
                                      policy=policy, run=run, output=output, command=cmd))
     # 稳定分组：所有模型/seed 训练结束后才开始评测。
@@ -127,6 +138,9 @@ def restore_rollout_config(args):
             setattr(args, key, value)
     # 旧套件硬编码 workers0；保持原协议，不按新默认值误认成 workers2。
     args.num_workers = saved.get("num_workers", 0)
+    args.distance_buckets = saved.get("distance_buckets", False)
+    args.distance_objects = saved.get("distance_objects", ["akita_black_bowl_1", "plate_1"])
+    args.distance_thresholds = saved.get("distance_thresholds", None)
     args.dataset = Path(saved["dataset"])
     print("Rollout settings restored from:", manifest, flush=True)
 
@@ -175,7 +189,7 @@ def run_job(job, args, env):
 
 
 def summarize(jobs, root):
-    rows, groups = [], {}
+    rows, groups, distance_rows = [], {}, []
     for job in jobs:
         if job["kind"] != "rollout" or not (job["output"] / "rollout.complete.json").exists():
             continue
@@ -185,6 +199,12 @@ def summarize(jobs, root):
                    success_rate=metrics["success_rate"], path=str(job["output"]))
         rows.append(row)
         groups.setdefault((job["model"], job["camera"], job["policy"]), []).append(row["success_rate"])
+        for bucket, values in metrics.get("by_distance_bucket", {}).items():
+            distance_rows.append({"model": job["model"], "camera": job["camera"],
+                                  "seed": job["seed"], "policy": job["policy"], "bucket": bucket,
+                                  "count": values["count"], "successes": values["successes"],
+                                  "success_rate": values["success_rate"],
+                                  "thresholds_m": json.dumps(metrics["distance_thresholds"])})
     if rows:
         with (root / "summary.csv").open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -193,10 +213,14 @@ def summarize(jobs, root):
                       "mean": statistics.mean(values), "std": statistics.stdev(values) if len(values) > 1 else None}
                      for key, values in groups.items()]
         (root / "aggregate.json").write_text(json.dumps(aggregate, indent=2))
+    if distance_rows:
+        with (root / "distance_summary.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(distance_rows[0]))
+            writer.writeheader(); writer.writerows(distance_rows)
 
 
-def main():
-    args = parse_args()
+def main(defaults=None):
+    args = parse_args(defaults)
     args.output_root = Path(args.output_root).expanduser().resolve()
     if args.stage == "rollout":
         restore_rollout_config(args)
@@ -234,6 +258,9 @@ def main():
         if manifest.exists():
             saved = json.loads(manifest.read_text())
             saved.setdefault("num_workers", 0)
+            saved.setdefault("distance_buckets", False)
+            saved.setdefault("distance_objects", ["akita_black_bowl_1", "plate_1"])
+            saved.setdefault("distance_thresholds", None)
             if saved != record:
                 differences = ["%s: saved=%r, current=%r" % (key, saved.get(key), record.get(key))
                                for key in sorted(set(saved) | set(record)) if saved.get(key) != record.get(key)]

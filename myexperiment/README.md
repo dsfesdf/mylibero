@@ -1,5 +1,7 @@
 # LIBERO BC、Action Chunking 与小型时序 Transformer
 
+本轮四模型、双相机、纯视觉、单seed对比见 [四模型双相机对比方案](四模型双相机对比方案.md)，入口 `run_dual_camera_comparison.py`；默认训练与 rollout 分开，带距离分桶汇总。
+
 纯视觉自动训练与评测：[自动训练与 rollout 方案](自动训练与rollout方案.md)，入口 `python myexperiment/run_suite.py --dataset ...`，默认预览，添加 `--execute` 才运行。
 
 本轮重跑：统一数据划分、seed、rollout 协议和 ACT best 选择，并新增无 CVAE 的确定性 ACT，见 [统一协议与确定性 ACT](统一协议与确定性ACT.md)。新结果使用 `results_v2/`，旧结果保留；训练恢复暂不做。

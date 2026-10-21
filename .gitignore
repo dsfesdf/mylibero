@@ -37,3 +37,12 @@ __pycache__/
 **/*.hdf5
 .sentry-native/
 *.pyc
+
+# ===== 实验结果目录（json/log/pt/视频等产物，不纳入版本控制）=====
+myexperiment/expv2/
+myexperiment/results_dual_camera/
+myexperiment/testbiggerlr/
+myexperiment/testbiggerlrepo/
+myexperiment/results_v2/
+myexperiment/results_v2_tuning/
+**/split0_seed*/

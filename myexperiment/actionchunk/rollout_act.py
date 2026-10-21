@@ -24,6 +24,8 @@ from experiment_protocol import add_rollout_args, rollout_indices, seed_episode,
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 from rollout_action_chunking import choose_action
+from distance_buckets import (get_object_distance, measure_init_state_distances,
+                              parse_thresholds, distance_bucket, bucket_summary)
 
 
 ABLATIONS = (
@@ -111,52 +113,6 @@ def load_model(checkpoint_path, device):
     return model, checkpoint, stats
 
 
-def get_object_distance(env, object_names):
-    task_env = env.env
-    body_ids = task_env.obj_body_id
-    missing = [name for name in object_names if name not in body_ids]
-    if missing:
-        raise KeyError(
-            f"找不到距离测量对象 {missing}；当前对象包括: {sorted(body_ids.keys())}"
-        )
-    first = env.sim.data.body_xpos[body_ids[object_names[0]]]
-    second = env.sim.data.body_xpos[body_ids[object_names[1]]]
-    return float(np.linalg.norm(first - second))
-
-
-def measure_init_state_distances(env, init_states, object_names, settle_steps):
-    distances = []
-    zero_action = np.zeros(7, dtype=np.float32)
-    for init_state in init_states:
-        env.reset()
-        env.set_init_state(init_state)
-        for _ in range(settle_steps):
-            env.step(zero_action)
-        distances.append(get_object_distance(env, object_names))
-    return distances
-
-
-def parse_thresholds(raw, distances):
-    if raw is None:
-        thresholds = np.quantile(np.asarray(distances, dtype=np.float64), [1 / 3, 2 / 3])
-    else:
-        try:
-            thresholds = np.asarray([float(value) for value in raw.split(",")], dtype=np.float64)
-        except ValueError as exc:
-            raise ValueError("--distance-thresholds 必须是两个逗号分隔的数字") from exc
-        if thresholds.shape != (2,) or thresholds[0] >= thresholds[1]:
-            raise ValueError("--distance-thresholds 必须满足 near_threshold < far_threshold")
-    return thresholds.tolist()
-
-
-def distance_bucket(distance, thresholds):
-    if distance <= thresholds[0]:
-        return "near"
-    if distance <= thresholds[1]:
-        return "medium"
-    return "far"
-
-
 def _settle(env, init_state, settle_steps):
     env.reset()
     obs = env.set_init_state(init_state)
@@ -203,7 +159,7 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
     )
     try:
         distances = measure_init_state_distances(
-            distance_env, init_states, args.distance_objects, args.settle_steps
+            distance_env, init_states, args.distance_objects, args.settle_steps, seed=seed
         )
     finally:
         distance_env.close()
@@ -321,16 +277,7 @@ def run_rollouts(args, model=None, checkpoint=None, stats=None, device=None):
             donor_env.close()
         env.close()
 
-    bucket_metrics = {}
-    for bucket in ("near", "medium", "far"):
-        records = [record for record in rollout_records if record["distance_bucket"] == bucket]
-        bucket_metrics[bucket] = {
-            "count": len(records),
-            "successes": sum(record["success"] for record in records),
-            "success_rate": (
-                float(np.mean([record["success"] for record in records])) if records else None
-            ),
-        }
+    bucket_metrics = bucket_summary(rollout_records)
     metrics = {
         "benchmark": args.benchmark,
         "task_id": args.task_id,

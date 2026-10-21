@@ -22,6 +22,7 @@ from bc import NormalizationStats, observation_image
 from experiment_protocol import add_rollout_args, rollout_indices, seed_episode, rollout_metadata
 from sequence_transformer import SmallSequenceTransformer
 from rollout_action_chunking import choose_action
+from distance_buckets import measure_init_state_distances, parse_thresholds, distance_bucket, bucket_summary
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
@@ -37,6 +38,9 @@ def parse_args():
     p.add_argument("--temporal-aggregation", action="store_true")
     p.add_argument("--aggregation-decay", type=float, default=0.2)
     p.add_argument("--history-size", type=int, default=None)
+    p.add_argument("--distance-buckets", action="store_true", help="统计初始物体距离及近中远成功率")
+    p.add_argument("--distance-objects", nargs=2, default=("akita_black_bowl_1", "plate_1"))
+    p.add_argument("--distance-thresholds", default=None, help="米制逗号分隔阈值；默认全部初始状态的三分位数")
     add_rollout_args(p)
     return p.parse_args()
 
@@ -64,6 +68,15 @@ def main():
     benchmark = get_benchmark(args.benchmark)(); task = benchmark.get_task(args.task_id)
     init_states = benchmark.get_task_init_states(args.task_id)
     indices = rollout_indices(args, len(init_states))
+    distances, thresholds, buckets, records = [], [], [], []
+    if args.distance_buckets:
+        distance_env = OffScreenRenderEnv(bddl_file_name=benchmark.get_task_bddl_file_path(args.task_id), camera_heights=128, camera_widths=128)
+        try:
+            distances = measure_init_state_distances(distance_env, init_states, args.distance_objects, args.settle_steps, seed=args.seed)
+        finally:
+            distance_env.close()
+        thresholds = parse_thresholds(args.distance_thresholds, distances)
+        buckets = [distance_bucket(d, thresholds) for d in distances]
     env = OffScreenRenderEnv(bddl_file_name=benchmark.get_task_bddl_file_path(args.task_id), camera_heights=128, camera_widths=128)
     successes, lengths, candidate_counts = [], [], []
     try:
@@ -90,6 +103,10 @@ def main():
                     success = True; break
             imageio.mimsave(output_dir / f"rollout_{rollout_id:03d}_{'success' if success else 'fail'}.mp4", frames, fps=20)
             successes.append(success); lengths.append(step + 1)
+            if args.distance_buckets:
+                records.append({"rollout_id": rollout_id, "init_state_index": init_index,
+                                "distance": distances[init_index], "distance_bucket": buckets[init_index],
+                                "success": bool(success), "steps": step + 1})
             print(f"rollout {rollout_id + 1}/{len(indices)}: init={init_index} success={success} steps={step + 1}", flush=True)
     finally:
         env.close()
@@ -104,6 +121,10 @@ def main():
         "episode_lengths": lengths, "success_rate": float(np.mean(successes)),
         "mean_candidate_count": float(np.mean(candidate_counts)) if candidate_counts else 0.0,
     }
+    if args.distance_buckets:
+        metrics.update(distance_objects=list(args.distance_objects), distance_thresholds=thresholds,
+                       all_init_state_distances=distances, all_init_state_buckets=buckets,
+                       rollouts=records, by_distance_bucket=bucket_summary(records))
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
 
